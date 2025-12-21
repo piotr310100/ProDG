@@ -286,7 +286,7 @@ def generate_and_compare(config: DictConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    output_dir = os.path.join(config.output_path, "Comparison_Prototypes")
+    output_dir = os.path.join(config.output_path, "Comparison_Prototypes_DDIM")
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"Loading EPIC Backbone: {config.model.name}")
