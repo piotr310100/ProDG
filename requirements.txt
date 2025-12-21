@@ -4,3 +4,6 @@ numpy==2.3.1
 omegaconf==2.3.0
 Pillow==11.3.0
 tqdm==4.67.1
+diffusers==0.36.0
+transformers==4.57.3
+accelerate==1.12.0

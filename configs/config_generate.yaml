@@ -1,0 +1,24 @@
+defaults:
+  - _self_
+  - config_base
+
+hydra:
+  run:
+    dir: ${output_path}/generate_diffusion
+
+exp:
+  run_func:
+    _target_: experiments.generate.generate_and_compare
+
+generation:
+  model_id: "runwayml/stable-diffusion-v1-5"
+  prompt: "A high quality professional photo of a bird in nature"
+  negative_prompt: "blurry, low quality, distortion, text, watermark"
+  num_steps: 200
+  guidance_scale: 7.5
+  purity_scale: 2.0
+  target_channels: null
+
+visualization:
+  num_prototypes: 5
+  img_fn: none

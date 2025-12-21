@@ -7,6 +7,8 @@ from .visualization import (
     visualize_combined_prototypes,
     visualize_explanations,
     visualize_prototypes,
+    compute_activation_bbox,
+    unnormalize,
 )
 
 __all__ = [
@@ -21,4 +23,6 @@ __all__ = [
     "visualize_combined_prototypes",
     "visualize_explanations",
     "visualize_prototypes",
+    "compute_activation_bbox",
+    "unnormalize"
 ]

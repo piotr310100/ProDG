@@ -54,7 +54,7 @@ def create_backbone_model(
         print(f"Loading custom weights from {custom_weights_path}")
         base_model = model_fn(weights=None).to(device)
         base_model = replace_classifier(base_model, model_name, num_classes)
-        state_dict = torch.load(custom_weights_path, map_location=device)
+        state_dict = torch.load(custom_weights_path, map_location=device, weights_only=False)
         base_model.load_state_dict(state_dict["model"])
         transform = ClassificationPresetEval(
             crop_size=224,
