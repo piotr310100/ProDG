@@ -333,12 +333,3 @@ def run_epic_generative(config: DictConfig):
             pbar.set_postfix({"purity": f"{purity_train.mean().item():.4f}"})
 
     U.save_state(config.output_path, f"{config.matrix.type}.pt")
-
-
-@hydra.main(config_path="conf", config_name="config", version_base="1.2")
-def main(cfg: DictConfig):
-    run_epic_generative(cfg)
-
-
-if __name__ == "__main__":
-    main()
