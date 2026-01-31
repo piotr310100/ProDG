@@ -16,6 +16,8 @@ class ModifiedHeadResnet(torch.nn.Module):
         self.b = fc.bias
 
     def _preprocess_input(self, x):
+        if self.U is None:
+            return x
         return pixelwise_multiply(x, self.U())
 
     def forward(self, x):
@@ -61,6 +63,8 @@ class ModifiedHeadConvNeXt(torch.nn.Module):
         return x
 
     def _preprocess_input(self, x):
+        if self.U is None:
+            return x
         return pixelwise_multiply(x, self.U())
 
     def forward(self, x):
@@ -88,6 +92,8 @@ class ModifiedHeadDenseNet(torch.nn.Module):
         self.b = fc.bias
 
     def _preprocess_input(self, x):
+        if self.U is None:
+            return x
         return pixelwise_multiply(x, self.U())
 
     def forward(self, x):
@@ -117,6 +123,8 @@ class ModifiedHeadSwinTransformer(torch.nn.Module):
         self.b = fc.bias
 
     def _preprocess_input(self, x):
+        if self.U is None:
+            return x
         return pixelwise_multiply(x, self.U())
 
     def forward(self, x):
