@@ -18,7 +18,7 @@ training:
   batch_size: 4
   lr: 0.001
   gen_steps: 10
-  guidance_scale: 1.0
+  purity_guidance_scale: 10.0
 
 explanations:
   top_k: 4
