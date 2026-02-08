@@ -15,7 +15,12 @@ from tqdm import tqdm
 from data import create_indexed_dataloader
 from matrix import create_matrix
 from models import create_backbone_model, create_modified_head
-from prototypes import compute_activation_bbox, pixelwise_multiply, topk_active_channels
+from prototypes import (
+    compute_activation_bbox,
+    pixelwise_multiply,
+    purity_argmax,
+    topk_active_channels,
+)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -28,15 +33,8 @@ def set_seeds(seed):
 
 
 def epic_purity(features, U, target_channels):
-    B, C, H, W = features.shape
     rotated = pixelwise_multiply(features.to(torch.float32), U.to(torch.float32))
-    flat = rotated.view(B, C, -1)
-    max_vals, _ = flat.max(dim=2)
-    l2 = torch.norm(flat, dim=2).clamp_min(1e-6)
-    return (
-        max_vals[torch.arange(B), target_channels]
-        / l2[torch.arange(B), target_channels]
-    )
+    return purity_argmax(rotated, target_channels)
 
 
 def decode_latents(pipeline, latents, height, width):
