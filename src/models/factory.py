@@ -58,7 +58,7 @@ def create_backbone_model(
         base_model.load_state_dict(state_dict["model"])
         transform = ClassificationPresetEval(
             crop_size=224,
-            resize_size=256,
+            resize_size=224,
             interpolation=InterpolationMode.BILINEAR,
         )
     else:
