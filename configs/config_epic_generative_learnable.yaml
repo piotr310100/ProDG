@@ -21,7 +21,6 @@ training:
   lambda_purity: 1.0
   lambda_reg: 0.001
   gen_steps: 10
-  purity_guidance_scale: 10.0
 
 explanations:
   top_k: 4

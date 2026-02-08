@@ -16,7 +16,7 @@ from tqdm import tqdm
 from data import create_indexed_dataloader
 from matrix import create_matrix
 from models import create_backbone_model, create_modified_head
-from prototypes import compute_activation_bbox, topk_active_channels
+from prototypes import compute_activation_bbox, pixelwise_multiply, topk_active_channels
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -30,9 +30,7 @@ def set_seeds(seed):
 
 def epic_purity(features, U, target_channels):
     B, C, H, W = features.shape
-    rotated = torch.einsum(
-        "bchw,cd->bdhw", features.to(torch.float32), U.to(torch.float32)
-    )
+    rotated = pixelwise_multiply(features.to(torch.float32), U.to(torch.float32))
     flat = rotated.view(B, C, -1)
     max_vals, _ = flat.max(dim=2)
     l2 = torch.norm(flat, dim=2).clamp_min(1e-6)
@@ -186,9 +184,7 @@ def run_epic_generative(config: DictConfig):
         torch.bfloat16
     )
 
-    opt_prompts = torch.optim.AdamW(
-        prompt_bank.parameters(), lr=config.training.lr_reg
-    )
+    opt_prompts = torch.optim.AdamW(prompt_bank.parameters(), lr=config.training.lr_reg)
     opt_U = torch.optim.AdamW(U.parameters(), lr=config.training.lr_purity)
 
     purity_history = []
@@ -255,8 +251,7 @@ def run_epic_generative(config: DictConfig):
 
             with torch.no_grad():
                 v_feats_raw = backbone((img_v_cuda - mean) / std)
-                v_feats_rot = torch.einsum(
-                    "bchw,cd->bdhw",
+                v_feats_rot = pixelwise_multiply(
                     v_feats_raw.to(torch.float32),
                     U().to(torch.float32),
                 )
@@ -309,8 +304,7 @@ def run_epic_generative(config: DictConfig):
 
                     with torch.no_grad():
                         proto_feats = backbone((proto_in - mean) / std)
-                        proto_rot = torch.einsum(
-                            "bchw,cd->bdhw",
+                        proto_rot = pixelwise_multiply(
                             proto_feats.to(torch.float32),
                             U().to(torch.float32),
                         )

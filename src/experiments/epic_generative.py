@@ -15,7 +15,7 @@ from tqdm import tqdm
 from data import create_indexed_dataloader
 from matrix import create_matrix
 from models import create_backbone_model, create_modified_head
-from prototypes import compute_activation_bbox, topk_active_channels
+from prototypes import compute_activation_bbox, pixelwise_multiply, topk_active_channels
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -27,17 +27,9 @@ def set_seeds(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def total_variation(x):
-    return torch.mean(torch.abs(x[:, :, :, :-1] - x[:, :, :, 1:])) + torch.mean(
-        torch.abs(x[:, :, :-1, :] - x[:, :, 1:, :])
-    )
-
-
 def epic_purity(features, U, target_channels):
     B, C, H, W = features.shape
-    rotated = torch.einsum(
-        "bchw,cd->bdhw", features.to(torch.float32), U.to(torch.float32)
-    )
+    rotated = pixelwise_multiply(features.to(torch.float32), U.to(torch.float32))
     flat = rotated.view(B, C, -1)
     max_vals, _ = flat.max(dim=2)
     l2 = torch.norm(flat, dim=2).clamp_min(1e-6)
@@ -109,9 +101,7 @@ def generate_prototype(
 
     if mu is not None:
         pipe.scheduler.set_timesteps(num_steps, device=device, mu=mu)
-        guidance_vec = torch.full(
-            (n,), 3.5, device=device, dtype=pipe.dtype
-        )
+        guidance_vec = torch.full((n,), 3.5, device=device, dtype=pipe.dtype)
     else:
         pipe.scheduler.set_timesteps(num_steps, device=device)
         guidance_vec = None
@@ -147,8 +137,8 @@ def generate_prototype(
                 x_in = F.interpolate(img_01, (224, 224), mode="bilinear")
 
                 feats = backbone((x_in - mean) / std)
-                rotated = torch.einsum(
-                    "bchw,cd->bdhw", feats.to(torch.float32), U_tensor.to(torch.float32)
+                rotated = pixelwise_multiply(
+                    feats.to(torch.float32), U_tensor.to(torch.float32)
                 )
                 flat = rotated.view(n, rotated.shape[1], -1)
                 max_vals, _ = flat.max(dim=2)
@@ -244,7 +234,7 @@ def run_epic_generative(config: DictConfig):
                 std,
                 channel_idx=target_channels[i],
                 num_steps=config.training.gen_steps,
-                purity_guidance_scale=config.training.purity_guidance_scale
+                purity_guidance_scale=config.training.purity_guidance_scale,
             )
             with torch.no_grad():
                 img_t = (
@@ -280,8 +270,7 @@ def run_epic_generative(config: DictConfig):
             img_v_cuda = img_v.to(device)
             with torch.no_grad():
                 v_feats_raw = backbone((img_v_cuda - mean) / std)
-                v_feats_rot = torch.einsum(
-                    "bchw,cd->bdhw",
+                v_feats_rot = pixelwise_multiply(
                     v_feats_raw.to(torch.float32),
                     U().to(torch.float32),
                 )
@@ -322,7 +311,7 @@ def run_epic_generative(config: DictConfig):
                     channel_idx=ch,
                     n=5,
                     num_steps=config.training.gen_steps,
-                    purity_guidance_scale=config.training.purity_guidance_scale
+                    purity_guidance_scale=config.training.purity_guidance_scale,
                 )
 
                 for col in range(5):
@@ -336,8 +325,7 @@ def run_epic_generative(config: DictConfig):
 
                     with torch.no_grad():
                         proto_feats = backbone((proto_in - mean) / std)
-                        proto_rot = torch.einsum(
-                            "bchw,cd->bdhw",
+                        proto_rot = pixelwise_multiply(
                             proto_feats.to(torch.float32),
                             U().to(torch.float32),
                         )
