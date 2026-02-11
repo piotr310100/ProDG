@@ -16,12 +16,7 @@ from tqdm import tqdm
 from data import create_indexed_dataloader
 from matrix import create_matrix
 from models import create_backbone_model, create_modified_head
-from prototypes import (
-    compute_activation_bbox,
-    pixelwise_multiply,
-    purity_argmax,
-    topk_active_channels,
-)
+from prototypes import compute_activation_bbox, pixelwise_multiply, topk_active_channels
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -34,8 +29,24 @@ def set_seeds(seed):
 
 
 def epic_purity(features, U, target_channels):
+    B, C, H, W = features.shape
     rotated = pixelwise_multiply(features.to(torch.float32), U.to(torch.float32))
-    return purity_argmax(rotated, target_channels)
+    batch_indices = torch.arange(B, device=features.device)
+    target_map = rotated[batch_indices, target_channels]
+
+    flat_map = target_map.view(B, -1)
+    max_act, max_idx = torch.max(flat_map, dim=-1)
+
+    max_y = max_idx // W
+    max_x = max_idx % W
+
+    all_channel_values = rotated[batch_indices, :, max_y, max_x]
+
+    l2_norm = torch.linalg.norm(all_channel_values, dim=-1).clamp_min(1e-8)
+
+    purity = max_act / l2_norm
+
+    return purity, max_act, target_map
 
 
 def decode_latents(pipeline, latents, height, width):
@@ -64,6 +75,8 @@ class LearnedPromptBank(nn.Module):
         ppe_init = ppe.repeat(num_channels, 1)
         ppe_init = ppe_init + torch.randn_like(ppe_init) * 0.05
 
+        self.register_buffer("pe_anchor", pe_init.clone())
+        self.register_buffer("ppe_anchor", ppe_init.clone())
         self.prompt_embeds = nn.Parameter(pe_init.clone())
         self.pooled_embeds = nn.Parameter(ppe_init.clone())
 
@@ -71,6 +84,8 @@ class LearnedPromptBank(nn.Module):
         return (
             self.prompt_embeds[channel_indices],
             self.pooled_embeds[channel_indices],
+            self.pe_anchor[channel_indices],
+            self.ppe_anchor[channel_indices],
         )
 
 
@@ -208,7 +223,9 @@ def run_epic_generative(config: DictConfig):
             0, model_bundle.num_channels, (B,), device=device
         )
 
-        pe, ppe = prompt_bank(target_channels)
+        U.requires_grad_(False)
+
+        pe, ppe, pea, ppea = prompt_bank(target_channels)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             generated_imgs = differentiable_flux_generate(
@@ -216,18 +233,28 @@ def run_epic_generative(config: DictConfig):
             )
             imgs_in = F.interpolate(generated_imgs, (224, 224), mode="bilinear")
             feats = backbone((imgs_in.float() - mean) / std)
-            purity_scores = epic_purity(feats, U(), target_channels)
+            purity_scores, max_act, t_map = epic_purity(feats, U(), target_channels)
             loss_purity = -config.training.lambda_purity * purity_scores.mean()
-            loss_reg = config.training.lambda_reg * (pe.norm() + ppe.norm())
-            total_loss = loss_purity + loss_reg
+            loss_reg = config.training.lambda_reg * F.mse_loss(pe, pea)
+            loss_act = -0.5 * torch.log(max_act + 1e-6).mean()
+            loss_sparse = (
+                -0.1 * (max_act / t_map.view(1, -1).mean(dim=1).clamp_min(1e-6)).mean()
+            )
+            total_loss = loss_purity + loss_reg + loss_act + loss_sparse
 
         opt_prompts.zero_grad(set_to_none=True)
-        opt_U.zero_grad(set_to_none=True)
 
         total_loss.backward()
 
         opt_prompts.step()
-        opt_U.step()
+        if step % 2 == 0:
+            U.requires_grad_(True)
+            opt_U.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                feats_static = feats.detach()
+            p_u, _, _ = epic_purity(feats_static, U(), target_channels)
+            (-config.training.lambda_purity * p_u.mean()).backward()
+            opt_U.step()
 
         purity_history.append(purity_scores.mean().item())
 
@@ -280,7 +307,7 @@ def run_epic_generative(config: DictConfig):
                 ch_tensor = torch.tensor([ch] * 5, device=device)
 
                 with torch.no_grad():
-                    pe_vis, ppe_vis = prompt_bank(ch_tensor)
+                    pe_vis, ppe_vis, _, _ = prompt_bank(ch_tensor)
 
                     ex_imgs_t = differentiable_flux_generate(
                         pipe,
