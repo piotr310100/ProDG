@@ -235,7 +235,7 @@ def run_epic_generative(config: DictConfig):
             feats = backbone((imgs_in.float() - mean) / std)
             purity_scores, max_act, t_map = epic_purity(feats, U(), target_channels)
             loss_purity = -config.training.lambda_purity * purity_scores.mean()
-            loss_reg = config.training.lambda_reg * F.mse_loss(pe, pea)
+            loss_reg = config.training.lambda_reg * (F.mse_loss(pe, pea), F.mse_loss(pea, ppea))
             loss_act = -0.5 * torch.log(max_act + 1e-6).mean()
             loss_sparse = (
                 -0.1 * (max_act / t_map.view(1, -1).mean(dim=1).clamp_min(1e-6)).mean()
