@@ -81,9 +81,11 @@ class LearnedPromptBank(nn.Module):
         self.pooled_embeds = nn.Parameter(ppe_init.clone())
 
     def forward(self, channel_indices):
+        prompt_embeds_ch = self.prompt_embeds[channel_indices]
+        pooled_embeds_ch = self.pooled_embeds[channel_indices]
         return (
-            self.prompt_embeds[channel_indices],
-            self.pooled_embeds[channel_indices],
+            prompt_embeds_ch + torch.randn_like(prompt_embeds_ch) * 0.05,
+            pooled_embeds_ch + torch.randn_like(pooled_embeds_ch) * 0.05,
             self.pe_anchor[channel_indices],
             self.ppe_anchor[channel_indices],
         )
@@ -235,7 +237,9 @@ def run_epic_generative(config: DictConfig):
             feats = backbone((imgs_in.float() - mean) / std)
             purity_scores, max_act, t_map = epic_purity(feats, U(), target_channels)
             loss_purity = -config.training.lambda_purity * purity_scores.mean()
-            loss_reg = config.training.lambda_reg * (F.mse_loss(pe, pea) + F.mse_loss(ppe, ppea))
+            loss_reg = config.training.lambda_reg * (
+                F.mse_loss(pe, pea) + F.mse_loss(ppe, ppea)
+            )
             loss_act = -0.5 * torch.log(max_act + 1e-6).mean()
             loss_sparse = (
                 -0.1 * (max_act / t_map.view(1, -1).mean(dim=1).clamp_min(1e-6)).mean()
