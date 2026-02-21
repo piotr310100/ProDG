@@ -57,7 +57,7 @@ def topk_active_channels(model, classification_head, image, k=4, device="cpu"):
             f"Input tensor must have 3 or 4 dimensions (C, H, W) or (B, C, H, W), but got {image.ndim} dimensions."
         )
     model.eval()
-    linear_head = classification_head.A
+    linear_head = classification_head.fc_weight
     image = image.cuda()
     feature_map = model(image)
     logits = classification_head(feature_map)

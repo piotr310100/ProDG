@@ -194,6 +194,7 @@ def run_epic_generative(config: DictConfig):
     U = create_matrix(config.matrix.type, model_bundle.num_channels, device).to(
         torch.float32
     )
+    mod_head = create_modified_head(base_model, config.model.name, U=U)
 
     prompt_bank = LearnedPromptBank(model_bundle.num_channels, pipe, device).to(
         torch.bfloat16
@@ -235,16 +236,20 @@ def run_epic_generative(config: DictConfig):
             )
             imgs_in = F.interpolate(generated_imgs, (224, 224), mode="bilinear")
             feats = backbone((imgs_in.float() - mean) / std)
+            logits = mod_head(feats)
+            probs = F.softmax(logits, dim=1)
+            entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=1).mean()
+            loss_entropy = config.training.lambda_entropy * entropy
             purity_scores, max_act, t_map = epic_purity(feats, U(), target_channels)
             loss_purity = -config.training.lambda_purity * purity_scores.mean()
             loss_reg = config.training.lambda_reg * (
                 F.mse_loss(pe, pea) + F.mse_loss(ppe, ppea)
             )
-            loss_act = -0.5 * torch.log(max_act + 1e-6).mean()
-            loss_sparse = (
-                -0.1 * (max_act / t_map.view(1, -1).mean(dim=1).clamp_min(1e-6)).mean()
-            )
-            total_loss = loss_purity + loss_reg + loss_act + loss_sparse
+            # loss_act = -0.5 * torch.log(max_act + 1e-6).mean()
+            # loss_sparse = (
+            #     -0.1 * (max_act / t_map.view(1, -1).mean(dim=1).clamp_min(1e-6)).mean()
+            # )
+            total_loss = loss_purity + loss_reg + loss_entropy
 
         opt_prompts.zero_grad(set_to_none=True)
 
@@ -276,7 +281,6 @@ def run_epic_generative(config: DictConfig):
                 img_v, _ = next(val_iter)
 
             img_v_cuda = img_v.to(device)
-            mod_head = create_modified_head(base_model, config.model.name, U=U)
 
             with torch.no_grad():
                 v_feats_raw = backbone((img_v_cuda - mean) / std)

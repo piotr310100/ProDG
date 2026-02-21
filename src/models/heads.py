@@ -3,141 +3,95 @@ import torch
 from prototypes import pixelwise_multiply
 
 
-class ModifiedHeadResnet(torch.nn.Module):
-    def __init__(self, model, U=None, device="cuda"):
-        super(ModifiedHeadResnet, self).__init__()
-        self.avgpool = list(model.children())[-2].to(device)
-        fc = list(model.children())[-1].to(device)
+class ModifiedHeadBase(torch.nn.Module):
+    def __init__(self, U=None, device="cuda"):
+        super().__init__()
         self.U = U
-        if U is None:
-            self.A = fc.weight
-        else:
-            self.A = fc.weight @ self.U.inverse()
-        self.b = fc.bias
+        self.device = device
+
+    @property
+    def disentanglement_matrix(self):
+        return self.U
+
+    @property
+    def fc_weight(self):
+        return self.linear_weight @ self.U.inverse()
 
     def _preprocess_input(self, x):
-        if self.U is None:
-            return x
         return pixelwise_multiply(x, self.U())
+
+    def _pool_and_flatten(self, x):
+        raise NotImplementedError("Subclasses must implement this method.")
 
     def forward(self, x):
         x = self._preprocess_input(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        return torch.nn.functional.linear(x, self.A, self.b)
+        x = self._pool_and_flatten(x)
+        return torch.nn.functional.linear(x, self.fc_weight, self.b)
 
     def before_linear(self, x):
         x = self._preprocess_input(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        return x
+        return self._pool_and_flatten(x)
 
 
-class ModifiedHeadConvNeXt(torch.nn.Module):
+class ModifiedHeadResnet(ModifiedHeadBase):
     def __init__(self, model, U=None, device="cuda"):
-        super(ModifiedHeadConvNeXt, self).__init__()
-        self.avgpool = list(model.children())[-2].to(device)
-        classifier = list(model.children())[-1].to(device)
+        super().__init__(U, device)
+        model = model.to(device)
+        self.avgpool = list(model.children())[-2]
+        fc = list(model.children())[-1]
+        self.linear_weight = fc.weight
+        self.b = fc.bias
+
+    def _pool_and_flatten(self, x):
+        x = self.avgpool(x)
+        return torch.flatten(x, 1)
+
+
+class ModifiedHeadConvNeXt(ModifiedHeadBase):
+    def __init__(self, model, U=None, device="cuda"):
+        super().__init__(U, device)
+        model = model.to(device)
+        self.avgpool = list(model.children())[-2]
+        classifier = list(model.children())[-1]
         self.eps = model.classifier[0].eps
         self.gamma = model.classifier[0].weight
         self.beta = model.classifier[0].bias
         self.flatten = classifier[1]
         fc = classifier[2]
-        self.U = U
-        if U is None:
-            self.A = fc.weight
-        else:
-            self.A = fc.weight @ self.U.inverse()
+        self.linear_weight = fc.weight
         self.b = fc.bias
 
-    def _layernorm(self, x):
-        mean = torch.mean(x, dim=(1, 2, 3), keepdim=True)
-        var = torch.var(
-            x.mean(dim=(2, 3), keepdim=True), dim=(1), keepdim=True, unbiased=False
-        )
-        x = (
-            torch.div(x - mean, torch.sqrt(var + self.eps))
-            .mul(self.gamma.view(1, -1, 1, 1))
-            .add(self.beta.view(1, -1, 1, 1))
-        )
-        return x
-
-    def _preprocess_input(self, x):
-        if self.U is None:
-            return x
-        return pixelwise_multiply(x, self.U())
-
-    def forward(self, x):
-        x = self._preprocess_input(x)
+    def _pool_and_flatten(self, x):
         x = self.avgpool(x)
-        x = self.flatten(x)
-        return torch.nn.functional.linear(x, self.A, self.b)
-
-    def before_linear(self, x):
-        x = self._preprocess_input(x)
-        x = self.avgpool(x)
-        x = self.flatten(x)
-        return x
+        return self.flatten(x)
 
 
-class ModifiedHeadDenseNet(torch.nn.Module):
+class ModifiedHeadDenseNet(ModifiedHeadBase):
     def __init__(self, model, U=None, device="cuda"):
-        super(ModifiedHeadDenseNet, self).__init__()
-        fc = model.classifier.to(device)
-        self.U = U
-        if U is None:
-            self.A = fc.weight
-        else:
-            self.A = fc.weight @ self.U.inverse()
+        super().__init__(U, device)
+        model = model.to(device)
+        fc = model.classifier
+        self.linear_weight = fc.weight
         self.b = fc.bias
 
-    def _preprocess_input(self, x):
-        if self.U is None:
-            return x
-        return pixelwise_multiply(x, self.U())
-
-    def forward(self, x):
-        x = self._preprocess_input(x)
+    def _pool_and_flatten(self, x):
         x = torch.nn.functional.adaptive_avg_pool2d(x, (1, 1))
-        x = torch.flatten(x, 1)
-        return torch.nn.functional.linear(x, self.A, self.b)
-
-    def before_linear(self, x):
-        x = self._preprocess_input(x)
-        x = torch.nn.functional.adaptive_avg_pool2d(x, (1, 1))
-        x = torch.flatten(x, 1)
-        return x
+        return torch.flatten(x, 1)
 
 
-class ModifiedHeadSwinTransformer(torch.nn.Module):
+class ModifiedHeadSwinTransformer(ModifiedHeadBase):
     def __init__(self, model, U=None, device="cuda"):
-        super(ModifiedHeadSwinTransformer, self).__init__()
-        self.avgpool = list(model.children())[-3].to(device)
-        self.flatten = list(model.children())[-2].to(device)
-        fc = list(model.children())[-1].to(device)
-        self.U = U
-        if U is None:
-            self.A = fc.weight
-        else:
-            self.A = fc.weight @ self.U.inverse()
+        super().__init__(U, device)
+        model = model.to(device)
+        self.avgpool = list(model.children())[-3]
+        self.flatten = list(model.children())[-2]
+        fc = list(model.children())[-1]
+        self.linear_weight = fc.weight
         self.b = fc.bias
 
-    def _preprocess_input(self, x):
-        if self.U is None:
-            return x
-        return pixelwise_multiply(x, self.U())
-
-    def forward(self, x):
-        x = self._preprocess_input(x)
+    def _pool_and_flatten(self, x):
         x = self.avgpool(x)
-        x = self.flatten(x)
-        return torch.nn.functional.linear(x, self.A, self.b)
-
-    def before_linear(self, x):
-        x = self._preprocess_input(x)
-        x = self.avgpool(x)
-        x = self.flatten(x)
-        return x
+        return self.flatten(x)
 
 
 HEAD_CLASSES = {

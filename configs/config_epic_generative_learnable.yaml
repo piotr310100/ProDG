@@ -15,11 +15,12 @@ generative_model:
 
 training:
   steps: 2000
-  batch_size: 4
+  batch_size: 32
   lr_purity: 0.001
   lr_reg: 0.01
   lambda_purity: 1.0
   lambda_reg: 0.001
+  lambda_entropy: 100
   gen_steps: 20
 
 explanations:
