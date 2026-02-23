@@ -3,6 +3,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from diffusers import FluxPipeline
 from omegaconf import DictConfig
@@ -19,6 +20,62 @@ from experiments.epic_generative_learnable import (
 from matrix import create_matrix
 from models import create_backbone_model, create_modified_head
 from prototypes import compute_activation_bbox, pixelwise_multiply, topk_active_channels
+
+
+def get_heatmap(
+    model: nn.Module,
+    modified_head: nn.Module,
+    images: torch.Tensor,
+    batch_size: int = 1,
+    device: torch.device | str = "cuda",
+    threshold: float = 0.1,
+) -> np.ndarray:
+    """
+    Generates heatmaps for given images based on the activations of the last
+    convolutional layer of a neural network model.
+    """
+
+    def process_batch(batch):
+        image = batch.to(device, non_blocking=True)
+        I = model(image)
+        lts = modified_head(I)
+        outs = modified_head._preprocess_input(I)
+        y = torch.argmax(lts, dim=1)
+        return lts, outs, y
+
+    with torch.inference_mode():
+        weight = modified_head.fc_weight.to(device)
+        results = map(process_batch, torch.split(images, batch_size, dim=0))
+        logits, last_conv, y_pred = zip(*results)
+
+        logits = torch.cat(logits, dim=0)
+        last_conv = torch.cat(last_conv, dim=0)
+        y_pred = torch.cat(y_pred, dim=0)
+
+        heatmap = torch.einsum("bi,biwh->biwh", weight[y_pred], last_conv)
+        mask = (heatmap.abs() > 0).float()
+        if modified_head.b is not None:
+            heatmap = heatmap + modified_head.b[y_pred].view(-1, 1, 1, 1).div(
+                last_conv.shape[1]
+            )
+        heatmap = heatmap * mask
+
+        heatmap = heatmap / torch.flatten(heatmap, start_dim=1, end_dim=-1).abs().max(
+            dim=-1
+        ).values.view(-1, 1, 1, 1)
+        heatmap = F.relu(heatmap)
+        heatmap_rescaled = (
+            F.interpolate(
+                heatmap,
+                images.shape[-2:],
+                mode="bilinear",
+            )
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+    return heatmap_rescaled
 
 
 def explain_predictions(config: DictConfig):
@@ -92,10 +149,16 @@ def explain_predictions(config: DictConfig):
                 break
 
             img_v_cuda = img_v.to(device)
+            img_v_norm = (img_v_cuda - mean) / std
 
-            v_feats_raw = backbone((img_v_cuda - mean) / std)
+            v_feats_raw = backbone(img_v_norm)
             v_feats_rot = pixelwise_multiply(
                 v_feats_raw.to(torch.float32), U().to(torch.float32)
+            )
+
+            # Fetch heatmap values for the entire original image across all channels
+            hm_orig = get_heatmap(
+                backbone, mod_head, img_v_norm, batch_size=1, device=device
             )
 
             top_ch = topk_active_channels(
@@ -106,7 +169,13 @@ def explain_predictions(config: DictConfig):
                 device=device,
             )
 
+            # Setup figures (Original figure and Overlay figure)
             fig, axes = plt.subplots(
+                config.visualization.k_top,
+                6,
+                figsize=(24, 4 * config.visualization.k_top),
+            )
+            fig_overlay, axes_overlay = plt.subplots(
                 config.visualization.k_top,
                 6,
                 figsize=(24, 4 * config.visualization.k_top),
@@ -133,6 +202,19 @@ def explain_predictions(config: DictConfig):
                 axes[row, 0].set_xticks([])
                 axes[row, 0].set_yticks([])
 
+                # Generate the overlay map for the specific channel dynamically normalized
+                hm_c = hm_orig[0, ch]
+                hm_c_norm = hm_c / (np.max(hm_c) + 1e-8)
+                alpha_c = np.where(hm_c_norm > 0.05, 0.5, 0.0)
+
+                axes_overlay[row, 0].imshow(np.array(orig_pil))
+                axes_overlay[row, 0].imshow(hm_c_norm, cmap="jet", alpha=alpha_c)
+                axes_overlay[row, 0].set_ylabel(
+                    f"Channel {ch}", fontsize=14, fontweight="bold"
+                )
+                axes_overlay[row, 0].set_xticks([])
+                axes_overlay[row, 0].set_yticks([])
+
                 ch_tensor = torch.tensor([ch] * 5, device=device)
                 pe, ppe, _, _ = prompt_bank(ch_tensor)
 
@@ -152,9 +234,15 @@ def explain_predictions(config: DictConfig):
                         proto_img_t.float(), (224, 224), mode="bilinear"
                     )
 
-                    proto_feats = backbone((proto_in - mean) / std)
+                    proto_in_norm = (proto_in - mean) / std
+                    proto_feats = backbone(proto_in_norm)
                     proto_rot = pixelwise_multiply(
                         proto_feats.to(torch.float32), U().to(torch.float32)
+                    )
+
+                    # Fetch the entire heatmap for the specific prototype visualization
+                    hm_proto = get_heatmap(
+                        backbone, mod_head, proto_in_norm, batch_size=1, device=device
                     )
 
                     px1, py1, px2, py2 = compute_activation_bbox(
@@ -173,13 +261,41 @@ def explain_predictions(config: DictConfig):
                     axes[row, col + 1].imshow(np.array(proto_pil))
                     axes[row, col + 1].axis("off")
 
-            plt.tight_layout()
-            save_path = os.path.join(
-                output_dir, f"explanation_{i:03d}.jpg"
-            )
-            plt.savefig(save_path, bbox_inches="tight")
-            plt.close()
+                    # Overlay for prototypes
+                    hm_p_c = hm_proto[0, ch]
+                    hm_p_c_tensor = torch.from_numpy(hm_p_c).unsqueeze(0).unsqueeze(0)
+                    hm_p_c_resized = (
+                        F.interpolate(
+                            hm_p_c_tensor,
+                            size=(proto_img_t.shape[2], proto_img_t.shape[3]),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        .squeeze()
+                        .numpy()
+                    )
 
-    print(
-        f"Finished. Explanations saved in {os.path.abspath(output_dir)}"
-    )
+                    hm_p_c_norm = hm_p_c_resized / (np.max(hm_p_c_resized) + 1e-8)
+                    alpha_p = np.where(hm_p_c_norm > 0.05, 0.5, 0.0)
+
+                    axes_overlay[row, col + 1].imshow(np.array(proto_pil))
+                    axes_overlay[row, col + 1].imshow(
+                        hm_p_c_norm, cmap="jet", alpha=alpha_p
+                    )
+                    axes_overlay[row, col + 1].axis("off")
+
+            # Save the bounding box grid
+            fig.tight_layout()
+            save_path = os.path.join(output_dir, f"explanation_{i:03d}.jpg")
+            fig.savefig(save_path, bbox_inches="tight")
+            plt.close(fig)
+
+            # Save the heatmap overlay grid
+            fig_overlay.tight_layout()
+            save_path_overlay = os.path.join(
+                output_dir, f"explanation_{i:03d}_overlay.jpg"
+            )
+            fig_overlay.savefig(save_path_overlay, bbox_inches="tight")
+            plt.close(fig_overlay)
+
+    print(f"Finished. Explanations saved in {os.path.abspath(output_dir)}")

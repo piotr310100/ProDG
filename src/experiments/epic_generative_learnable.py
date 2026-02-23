@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms as T
 from diffusers import FluxPipeline
 from omegaconf import DictConfig
 from PIL import ImageDraw
@@ -18,7 +19,91 @@ from matrix import create_matrix
 from models import create_backbone_model, create_modified_head
 from prototypes import compute_activation_bbox, pixelwise_multiply, topk_active_channels
 
+augment = T.RandomAffine(degrees=15, translate=(0.2, 0.2), scale=(0.8, 1.2))
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def get_heatmap(
+    model: nn.Module,
+    modified_head: nn.Module,
+    images: torch.Tensor,
+    batch_size: int = 1,
+    device: torch.device | str = "cuda",
+    threshold: float = 0.1,
+) -> np.ndarray:
+    """
+    Generates heatmaps for given images based on the activations of the last
+    convolutional layer of a neural network model.
+
+    Args:
+        model (nn.Module): The neural network model.
+        images (Tensor): Input images.
+        batch_size (int): Batch size for processing images.
+        device (torch.device | str): Device to use for computation.
+        threshold (float, optional): Threshold for heatmap visualization from range (0, 0.5). Defaults to 0.1.
+
+    Returns:
+        np.ndarray: Rescaled heatmap array interpolated to the input image size.
+    """
+
+    def process_batch(batch):
+        """
+        Process a batch of images through the model.
+
+        Args:
+            batch (Tensor): Batch of images.
+
+        Returns:
+            tuple: Tuple containing:
+                - Tensor: Logits.
+                - Tensor: Last convolutional layer activations.
+                - Tensor: Predicted labels.
+        """
+        image = batch.to(device, non_blocking=True)
+        I = model(image)
+        lts = modified_head(I)
+        outs = modified_head._preprocess_input(I)
+        y = torch.argmax(lts, dim=1)
+        return lts, outs, y
+
+    with torch.inference_mode():
+        weight = modified_head.fc_weight.to(device)
+        # Process images in batches
+        results = map(process_batch, torch.split(images, batch_size, dim=0))
+        logits, last_conv, y_pred = zip(*results)
+
+        # Concatenate results
+        logits = torch.cat(logits, dim=0)
+        last_conv = torch.cat(last_conv, dim=0)
+        y_pred = torch.cat(y_pred, dim=0)
+
+        # Generate heatmap
+        heatmap = torch.einsum("bi,biwh->biwh", weight[y_pred], last_conv)
+        mask = (heatmap.abs() > 0).float()
+        if modified_head.b is not None:
+            heatmap = heatmap + modified_head.b[y_pred].view(-1, 1, 1, 1).div(
+                last_conv.shape[1]
+            )
+        heatmap = heatmap * mask
+
+        # Normalize the heatmap for visualization
+        heatmap = heatmap / torch.flatten(heatmap, start_dim=1, end_dim=-1).abs().max(
+            dim=-1
+        ).values.view(-1, 1, 1, 1)  # changing value to [-1, 1]
+        heatmap = F.relu(heatmap)  # only positive values
+        heatmap_rescaled = (
+            F.interpolate(
+                heatmap,
+                images.shape[-2:],
+                mode="bilinear",
+            )
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+    return heatmap_rescaled
 
 
 def set_seeds(seed):
@@ -219,12 +304,15 @@ def run_epic_generative(config: DictConfig):
     val_iter = iter(val_loader)
 
     pbar = tqdm(range(config.training.steps), desc="Learning Concepts")
+    lambda_div = 1.0
+    lambda_disent = 0.5
 
     for step in pbar:
-        B = config.training.batch_size
-        target_channels = torch.randint(
-            0, model_bundle.num_channels, (B,), device=device
+        half_batch = config.training.batch_size // 2
+        unique_channels = torch.randint(
+            0, model_bundle.num_channels, (half_batch,), device=device
         )
+        target_channels = unique_channels.repeat(2)
 
         U.requires_grad_(False)
 
@@ -235,7 +323,15 @@ def run_epic_generative(config: DictConfig):
                 pipe, pe, ppe, num_steps=config.training.gen_steps, device=device
             )
             imgs_in = F.interpolate(generated_imgs, (224, 224), mode="bilinear")
-            feats = backbone((imgs_in.float() - mean) / std)
+
+            imgs_in_aug = augment(imgs_in)
+
+            feats = backbone((imgs_in_aug.float() - mean) / std)
+
+            feats_rot = pixelwise_multiply(
+                feats.to(torch.float32), U().to(torch.float32)
+            )
+
             logits = mod_head(feats)
             probs = F.softmax(logits, dim=1)
             entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=1).mean()
@@ -245,11 +341,46 @@ def run_epic_generative(config: DictConfig):
             loss_reg = config.training.lambda_reg * (
                 F.mse_loss(pe, pea) + F.mse_loss(ppe, ppea)
             )
-            # loss_act = -0.5 * torch.log(max_act + 1e-6).mean()
-            # loss_sparse = (
-            #     -0.1 * (max_act / t_map.view(1, -1).mean(dim=1).clamp_min(1e-6)).mean()
-            # )
-            total_loss = loss_purity + loss_reg + loss_entropy
+
+            loss_act = -0.5 * torch.log(max_act + 1e-6).mean()
+            loss_sparse = (
+                -0.1 * (max_act / t_map.view(1, -1).mean(dim=1).clamp_min(1e-6)).mean()
+            )
+
+            f1, f2 = feats_rot.chunk(2, dim=0)
+
+            f1_flat = F.adaptive_avg_pool2d(f1, 1).squeeze()
+            f2_flat = F.adaptive_avg_pool2d(f2, 1).squeeze()
+
+            similarity = F.cosine_similarity(f1_flat, f2_flat, dim=1)
+
+            loss_div = lambda_div * similarity.mean()
+
+            B_sz, C_sz, H_sz, W_sz = feats_rot.shape
+            flat_target_map = feats_rot[torch.arange(B_sz), target_channels].view(
+                B_sz, -1
+            )
+            max_vals, max_indices = torch.max(flat_target_map, dim=1)
+
+            spatial_max_feats = (
+                feats_rot.view(B_sz, C_sz, -1)
+                .gather(2, max_indices.view(B_sz, 1, 1).expand(-1, C_sz, -1))
+                .squeeze(2)
+            )
+
+            loss_disent = lambda_disent * F.cross_entropy(
+                spatial_max_feats, target_channels
+            )
+
+            total_loss = (
+                loss_purity
+                + loss_reg
+                + loss_entropy
+                + loss_act
+                + loss_sparse
+                + loss_div
+                + loss_disent
+            )
 
         opt_prompts.zero_grad(set_to_none=True)
 
@@ -267,7 +398,7 @@ def run_epic_generative(config: DictConfig):
 
         purity_history.append(purity_scores.mean().item())
 
-        if step % 50 == 0 or (step + 1) == config.training.steps:
+        if step % 200 == 0 or (step + 1) == config.training.steps:
             plt.figure(figsize=(10, 6))
             plt.plot(purity_history, color="tab:blue")
             plt.title(f"EPIC Purity Progress (Iter {step + 1})")
@@ -283,16 +414,22 @@ def run_epic_generative(config: DictConfig):
             img_v_cuda = img_v.to(device)
 
             with torch.no_grad():
-                v_feats_raw = backbone((img_v_cuda - mean) / std)
+                img_v_norm = (img_v_cuda - mean) / std
+                v_feats_raw = backbone(img_v_norm)
                 v_feats_rot = pixelwise_multiply(
                     v_feats_raw.to(torch.float32),
                     U().to(torch.float32),
+                )
+
+                hm_orig = get_heatmap(
+                    backbone, mod_head, img_v_norm, batch_size=1, device=device
                 )
 
             top_ch = topk_active_channels(
                 backbone, mod_head, img_v_cuda[0], k=4, device=device
             )
             fig, axes = plt.subplots(4, 6, figsize=(24, 16))
+            fig_overlay, axes_overlay = plt.subplots(4, 6, figsize=(24, 16))
 
             for row, ch in enumerate(top_ch):
                 orig_img_tensor = (img_v_cuda[0].cpu() * s_3d + m_3d).clip(0, 1)
@@ -311,6 +448,18 @@ def run_epic_generative(config: DictConfig):
                 axes[row, 0].set_ylabel(f"Channel {ch}", fontsize=14, fontweight="bold")
                 axes[row, 0].set_xticks([])
                 axes[row, 0].set_yticks([])
+
+                hm_c = hm_orig[0, ch]
+                hm_c_norm = hm_c / (np.max(hm_c) + 1e-8)
+                alpha_c = np.where(hm_c_norm > 0.05, 0.5, 0.0)
+
+                axes_overlay[row, 0].imshow(np.array(orig_pil))
+                axes_overlay[row, 0].imshow(hm_c_norm, cmap="jet", alpha=alpha_c)
+                axes_overlay[row, 0].set_ylabel(
+                    f"Channel {ch}", fontsize=14, fontweight="bold"
+                )
+                axes_overlay[row, 0].set_xticks([])
+                axes_overlay[row, 0].set_yticks([])
 
                 ch_tensor = torch.tensor([ch] * 5, device=device)
 
@@ -336,14 +485,23 @@ def run_epic_generative(config: DictConfig):
                     proto_in = F.interpolate(proto_t, (224, 224), mode="bilinear")
 
                     with torch.no_grad():
-                        proto_feats = backbone((proto_in - mean) / std)
+                        proto_in_norm = (proto_in - mean) / std
+                        proto_feats = backbone(proto_in_norm)
                         proto_rot = pixelwise_multiply(
                             proto_feats.to(torch.float32),
                             U().to(torch.float32),
                         )
 
+                        hm_proto = get_heatmap(
+                            backbone,
+                            mod_head,
+                            proto_in_norm,
+                            batch_size=1,
+                            device=device,
+                        )
+
                     px1, py1, px2, py2 = compute_activation_bbox(
-                        proto_rot[0, ch].unsqueeze(0), (256, 256)
+                        proto_rot[0, ch].unsqueeze(0), (224, 224)
                     )
 
                     proto_pil = to_pil_image(
@@ -358,11 +516,41 @@ def run_epic_generative(config: DictConfig):
                     axes[row, col + 1].imshow(np.array(proto_pil))
                     axes[row, col + 1].axis("off")
 
-            plt.tight_layout()
-            plt.savefig(
+                    hm_p_c = hm_proto[0, ch]
+                    hm_p_c_tensor = torch.from_numpy(hm_p_c).unsqueeze(0).unsqueeze(0)
+                    hm_p_c_resized = (
+                        F.interpolate(
+                            hm_p_c_tensor,
+                            size=(224, 224),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        .squeeze()
+                        .numpy()
+                    )
+
+                    hm_p_c_norm = hm_p_c_resized / (np.max(hm_p_c_resized) + 1e-8)
+                    alpha_p = np.where(hm_p_c_norm > 0.05, 0.5, 0.0)
+
+                    axes_overlay[row, col + 1].imshow(np.array(proto_pil))
+                    axes_overlay[row, col + 1].imshow(
+                        hm_p_c_norm, cmap="jet", alpha=alpha_p
+                    )
+                    axes_overlay[row, col + 1].axis("off")
+
+            fig.tight_layout()
+            fig.savefig(
                 os.path.join(grid_dir, f"step_{step + 1:04d}.jpg"), bbox_inches="tight"
             )
-            plt.close()
+            plt.close(fig)
+
+            fig_overlay.tight_layout()
+            fig_overlay.savefig(
+                os.path.join(grid_dir, f"step_{step + 1:04d}_overlay.jpg"),
+                bbox_inches="tight",
+            )
+            plt.close(fig_overlay)
+
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -372,6 +560,13 @@ def run_epic_generative(config: DictConfig):
                     "purity": f"{purity_scores.mean().item():.4f}",
                     "reg": f"{loss_reg.item():.4f}",
                 }
+            )
+
+        if step % 200 == 0:
+            U.save_state(config.output_path, f"{config.matrix.type}.pt")
+            torch.save(
+                prompt_bank.state_dict(),
+                os.path.join(config.output_path, "learned_prompts.pt"),
             )
 
     U.save_state(config.output_path, f"{config.matrix.type}.pt")
