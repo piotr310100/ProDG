@@ -19,8 +19,6 @@ from matrix import create_matrix
 from models import create_backbone_model, create_modified_head
 from prototypes import compute_activation_bbox, pixelwise_multiply, topk_active_channels
 
-augment = T.RandomAffine(degrees=15, translate=(0.2, 0.2), scale=(0.8, 1.2))
-
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -181,6 +179,7 @@ def differentiable_flux_generate(
     prompt_embeds,
     pooled_prompt_embeds,
     num_steps=4,
+    guidance_scale=None,
     device="cuda",
     height=256,
     width=256,
@@ -220,7 +219,13 @@ def differentiable_flux_generate(
         pipe.scheduler.set_timesteps(num_steps, device=device, mu=mu)
     else:
         pipe.scheduler.set_timesteps(num_steps, device=device)
-    guidance_vec = torch.full((batch_size,), 3.5, device=device, dtype=torch.bfloat16)
+
+    if guidance_scale is not None:
+        guidance_vec = torch.full(
+            (batch_size,), guidance_scale, device=device, dtype=torch.bfloat16
+        )
+    else:
+        guidance_vec = None
 
     for t in pipe.scheduler.timesteps:
         noise_pred = pipe.transformer(
@@ -304,97 +309,60 @@ def run_epic_generative(config: DictConfig):
     val_iter = iter(val_loader)
 
     pbar = tqdm(range(config.training.steps), desc="Learning Concepts")
-    lambda_div = 1.0
-    lambda_disent = 0.5
 
     for step in pbar:
-        half_batch = config.training.batch_size // 2
-        unique_channels = torch.randint(
-            0, model_bundle.num_channels, (half_batch,), device=device
+        target_channels = torch.randint(
+            0, model_bundle.num_channels, (config.training.batch_size,), device=device
         )
-        target_channels = unique_channels.repeat(2)
 
-        U.requires_grad_(False)
+        is_U_update = (step % 5 == 0) or (step < config.training.warmup_steps)
+        U.requires_grad_(is_U_update)
 
         pe, ppe, pea, ppea = prompt_bank(target_channels)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             generated_imgs = differentiable_flux_generate(
-                pipe, pe, ppe, num_steps=config.training.gen_steps, device=device
+                pipe,
+                pe,
+                ppe,
+                num_steps=config.generative_model.gen_steps,
+                guidance_scale=config.generative_model.guidance_scale,
+                device=device,
             )
             imgs_in = F.interpolate(generated_imgs, (224, 224), mode="bilinear")
 
-            imgs_in_aug = augment(imgs_in)
+            feats = backbone((imgs_in.float() - mean) / std)
 
-            feats = backbone((imgs_in_aug.float() - mean) / std)
-
-            feats_rot = pixelwise_multiply(
-                feats.to(torch.float32), U().to(torch.float32)
+        if step < config.training.warmup_steps:
+            purity_scores, _, _ = epic_purity(
+                feats.detach().to(torch.float32), U().to(torch.float32), target_channels
             )
-
-            logits = mod_head(feats)
-            probs = F.softmax(logits, dim=1)
-            entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=1).mean()
-            loss_entropy = config.training.lambda_entropy * entropy
-            purity_scores, max_act, t_map = epic_purity(feats, U(), target_channels)
+            loss_purity = -config.training.lambda_purity * purity_scores.mean()
+            opt_U.zero_grad(set_to_none=True)
+            loss_purity.backward()
+            opt_U.step()
+        else:
+            purity_scores, _, _ = epic_purity(
+                feats.to(torch.float32), U().to(torch.float32), target_channels
+            )
             loss_purity = -config.training.lambda_purity * purity_scores.mean()
             loss_reg = config.training.lambda_reg * (
                 F.mse_loss(pe, pea) + F.mse_loss(ppe, ppea)
             )
 
-            loss_act = -0.5 * torch.log(max_act + 1e-6).mean()
-            loss_sparse = (
-                -0.1 * (max_act / t_map.view(1, -1).mean(dim=1).clamp_min(1e-6)).mean()
-            )
+            diff_i = torch.abs(imgs_in[:, :, :, 1:] - imgs_in[:, :, :, :-1])
+            diff_j = torch.abs(imgs_in[:, :, 1:, :] - imgs_in[:, :, :-1, :])
+            loss_tv = config.training.lambda_tv * (diff_i.mean() + diff_j.mean())
 
-            f1, f2 = feats_rot.chunk(2, dim=0)
+            total_loss = loss_purity + loss_reg + loss_tv
 
-            f1_flat = F.adaptive_avg_pool2d(f1, 1).squeeze()
-            f2_flat = F.adaptive_avg_pool2d(f2, 1).squeeze()
-
-            similarity = F.cosine_similarity(f1_flat, f2_flat, dim=1)
-
-            loss_div = lambda_div * similarity.mean()
-
-            B_sz, C_sz, H_sz, W_sz = feats_rot.shape
-            flat_target_map = feats_rot[torch.arange(B_sz), target_channels].view(
-                B_sz, -1
-            )
-            max_vals, max_indices = torch.max(flat_target_map, dim=1)
-
-            spatial_max_feats = (
-                feats_rot.view(B_sz, C_sz, -1)
-                .gather(2, max_indices.view(B_sz, 1, 1).expand(-1, C_sz, -1))
-                .squeeze(2)
-            )
-
-            loss_disent = lambda_disent * F.cross_entropy(
-                spatial_max_feats, target_channels
-            )
-
-            total_loss = (
-                loss_purity
-                + loss_reg
-                + loss_entropy
-                + loss_act
-                + loss_sparse
-                + loss_div
-                + loss_disent
-            )
-
-        opt_prompts.zero_grad(set_to_none=True)
-
-        total_loss.backward()
-
-        opt_prompts.step()
-        if step % 2 == 0:
-            U.requires_grad_(True)
+            opt_prompts.zero_grad(set_to_none=True)
             opt_U.zero_grad(set_to_none=True)
-            with torch.no_grad():
-                feats_static = feats.detach()
-            p_u, _, _ = epic_purity(feats_static, U(), target_channels)
-            (-config.training.lambda_purity * p_u.mean()).backward()
-            opt_U.step()
+            total_loss.backward()
+            opt_prompts.step()
+
+            if is_U_update:
+                opt_U.step()
 
         purity_history.append(purity_scores.mean().item())
 
@@ -470,7 +438,8 @@ def run_epic_generative(config: DictConfig):
                         pipe,
                         pe_vis,
                         ppe_vis,
-                        num_steps=config.training.gen_steps,
+                        num_steps=config.generative_model.gen_steps,
+                        guidance_scale=config.generative_model.guidance_scale,
                         device=device,
                     )
                     ex_imgs = ex_imgs_t.float().cpu().permute(0, 2, 3, 1).numpy()
@@ -555,12 +524,7 @@ def run_epic_generative(config: DictConfig):
             torch.cuda.empty_cache()
 
         if step % 5 == 0:
-            pbar.set_postfix(
-                {
-                    "purity": f"{purity_scores.mean().item():.4f}",
-                    "reg": f"{loss_reg.item():.4f}",
-                }
-            )
+            pbar.set_postfix({"purity": f"{purity_scores.mean().item():.4f}"})
 
         if step % 200 == 0:
             U.save_state(config.output_path, f"{config.matrix.type}.pt")

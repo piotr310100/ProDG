@@ -224,6 +224,7 @@ def explain_predictions(config: DictConfig):
                         pe,
                         ppe,
                         num_steps=config.generative_model.gen_steps,
+                        guidance_scale=config.generative_model.guidance_scale,
                         device=device,
                         seed=config.seed,
                     )
