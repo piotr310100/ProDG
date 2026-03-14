@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from data import create_indexed_dataloader
 from experiments.epic_generative_learnable import (
-    LearnedPromptBank,
+    VariationalPromptBank,
     differentiable_flux_generate,
     set_seeds,
 )
@@ -117,7 +117,7 @@ def explain_predictions(config: DictConfig):
     U.load_state_dict(torch.load(u_path, map_location=device))
     U.eval()
 
-    prompt_bank = LearnedPromptBank(model_bundle.num_channels, pipe, device).to(
+    prompt_bank = VariationalPromptBank(model_bundle.num_channels, pipe, device).to(
         torch.bfloat16
     )
     prompt_path = os.path.join(checkpoint_dir, "learned_prompts.pt")

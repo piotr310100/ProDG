@@ -174,6 +174,67 @@ class LearnedPromptBank(nn.Module):
         )
 
 
+class VariationalPromptBank(nn.Module):
+    def __init__(self, num_channels, pipe, device):
+        super().__init__()
+        self.num_channels = num_channels
+        self.device = device
+
+        with torch.no_grad():
+            prompt = ""
+            pe, ppe, _ = pipe.encode_prompt(
+                prompt=[prompt], prompt_2=None, device=device
+            )
+
+        pe_init = pe.repeat(num_channels, 1, 1)
+        pe_init = pe_init + torch.randn_like(pe_init) * 0.05
+
+        ppe_init = ppe.repeat(num_channels, 1)
+        ppe_init = ppe_init + torch.randn_like(ppe_init) * 0.05
+
+        self.register_buffer("pe_anchor", pe_init.clone())
+        self.register_buffer("ppe_anchor", ppe_init.clone())
+
+        self.pe_mu = nn.Parameter(pe_init.clone())
+        self.pe_logvar = nn.Parameter(torch.full_like(pe_init, -3.0))
+        self.ppe_mu = nn.Parameter(ppe_init.clone())
+        self.ppe_logvar = nn.Parameter(torch.full_like(ppe_init, -3.0))
+
+    def forward(self, channel_indices):
+        mu = self.pe_mu[channel_indices]
+        logvar = self.pe_logvar[channel_indices]
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        pe = mu + eps * std
+        ppe = self.ppe_mu[channel_indices] + torch.randn_like(
+            self.ppe_logvar[channel_indices]
+        ) * torch.exp(0.5 * self.ppe_logvar[channel_indices])
+
+        return (
+            pe,
+            ppe,
+            self.pe_anchor[channel_indices],
+            self.ppe_anchor[channel_indices],
+        )
+
+    def kl_loss(self, channel_indices):
+        def kld(mu, logvar, anchor):
+            return -0.5 * torch.sum(1 + logvar - (mu - anchor).pow(2) - logvar.exp())
+
+        loss_pe = kld(
+            self.pe_mu[channel_indices],
+            self.pe_logvar[channel_indices],
+            self.pe_anchor[channel_indices],
+        )
+        loss_ppe = kld(
+            self.ppe_mu[channel_indices],
+            self.ppe_logvar[channel_indices],
+            self.ppe_anchor[channel_indices],
+        )
+
+        return (loss_pe + loss_ppe) / channel_indices.shape[0]
+
+
 def differentiable_flux_generate(
     pipe,
     prompt_embeds,
@@ -286,7 +347,7 @@ def run_epic_generative(config: DictConfig):
     )
     mod_head = create_modified_head(base_model, config.model.name, U=U)
 
-    prompt_bank = LearnedPromptBank(model_bundle.num_channels, pipe, device).to(
+    prompt_bank = VariationalPromptBank(model_bundle.num_channels, pipe, device).to(
         torch.bfloat16
     )
 
@@ -346,9 +407,7 @@ def run_epic_generative(config: DictConfig):
                 feats.to(torch.float32), U().to(torch.float32), target_channels
             )
             loss_purity = -config.training.lambda_purity * purity_scores.mean()
-            loss_reg = config.training.lambda_reg * (
-                F.mse_loss(pe, pea) + F.mse_loss(ppe, ppea)
-            )
+            loss_reg = config.training.lambda_reg * prompt_bank.kl_loss(target_channels)
 
             diff_i = torch.abs(imgs_in[:, :, :, 1:] - imgs_in[:, :, :, :-1])
             diff_j = torch.abs(imgs_in[:, :, 1:, :] - imgs_in[:, :, :-1, :])
