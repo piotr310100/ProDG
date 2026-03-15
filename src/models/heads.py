@@ -15,9 +15,13 @@ class ModifiedHeadBase(torch.nn.Module):
 
     @property
     def fc_weight(self):
+        if self.U is None:
+            return self.linear_weight
         return self.linear_weight @ self.U.inverse()
 
     def _preprocess_input(self, x):
+        if self.U is None:
+            return x
         return pixelwise_multiply(x, self.U())
 
     def _pool_and_flatten(self, x):

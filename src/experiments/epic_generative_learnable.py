@@ -1,4 +1,5 @@
 import gc
+import math
 import os
 import random
 
@@ -113,7 +114,7 @@ def set_seeds(seed):
 
 def epic_purity(features, U, target_channels):
     B, C, H, W = features.shape
-    rotated = pixelwise_multiply(features.to(torch.float32), U.to(torch.float32))
+    rotated = pixelwise_multiply(features, U)
     batch_indices = torch.arange(B, device=features.device)
     target_map = rotated[batch_indices, target_channels]
 
@@ -140,40 +141,6 @@ def decode_latents(pipeline, latents, height, width):
     ).sample
 
 
-class LearnedPromptBank(nn.Module):
-    def __init__(self, num_channels, pipe, device):
-        super().__init__()
-        self.num_channels = num_channels
-        self.device = device
-
-        with torch.no_grad():
-            prompt = ""
-            pe, ppe, _ = pipe.encode_prompt(
-                prompt=[prompt], prompt_2=None, device=device
-            )
-
-        pe_init = pe.repeat(num_channels, 1, 1)
-        pe_init = pe_init + torch.randn_like(pe_init) * 0.05
-
-        ppe_init = ppe.repeat(num_channels, 1)
-        ppe_init = ppe_init + torch.randn_like(ppe_init) * 0.05
-
-        self.register_buffer("pe_anchor", pe_init.clone())
-        self.register_buffer("ppe_anchor", ppe_init.clone())
-        self.prompt_embeds = nn.Parameter(pe_init.clone())
-        self.pooled_embeds = nn.Parameter(ppe_init.clone())
-
-    def forward(self, channel_indices):
-        prompt_embeds_ch = self.prompt_embeds[channel_indices]
-        pooled_embeds_ch = self.pooled_embeds[channel_indices]
-        return (
-            prompt_embeds_ch + torch.randn_like(prompt_embeds_ch) * 0.05,
-            pooled_embeds_ch + torch.randn_like(pooled_embeds_ch) * 0.05,
-            self.pe_anchor[channel_indices],
-            self.ppe_anchor[channel_indices],
-        )
-
-
 class VariationalPromptBank(nn.Module):
     def __init__(self, num_channels, pipe, device):
         super().__init__()
@@ -187,29 +154,24 @@ class VariationalPromptBank(nn.Module):
             )
 
         pe_init = pe.repeat(num_channels, 1, 1)
-        pe_init = pe_init + torch.randn_like(pe_init) * 0.05
-
         ppe_init = ppe.repeat(num_channels, 1)
-        ppe_init = ppe_init + torch.randn_like(ppe_init) * 0.05
 
         self.register_buffer("pe_anchor", pe_init.clone())
         self.register_buffer("ppe_anchor", ppe_init.clone())
 
         self.pe_mu = nn.Parameter(pe_init.clone())
-        self.pe_logvar = nn.Parameter(torch.full_like(pe_init, -3.0))
+        self.pe_logvar = nn.Parameter(torch.full_like(pe_init, -2.0))
         self.ppe_mu = nn.Parameter(ppe_init.clone())
-        self.ppe_logvar = nn.Parameter(torch.full_like(ppe_init, -3.0))
+        self.ppe_logvar = nn.Parameter(torch.full_like(ppe_init, -2.0))
 
     def forward(self, channel_indices):
         mu = self.pe_mu[channel_indices]
-        logvar = self.pe_logvar[channel_indices]
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        pe = mu + eps * std
-        ppe = self.ppe_mu[channel_indices] + torch.randn_like(
-            self.ppe_logvar[channel_indices]
-        ) * torch.exp(0.5 * self.ppe_logvar[channel_indices])
+        std = torch.exp(0.5 * self.pe_logvar[channel_indices])
+        pe = mu + torch.randn_like(std) * std
 
+        ppe_mu = self.ppe_mu[channel_indices]
+        ppe_std = torch.exp(0.5 * self.ppe_logvar[channel_indices])
+        ppe = ppe_mu + torch.randn_like(ppe_std) * ppe_std
         return (
             pe,
             ppe,
@@ -218,15 +180,24 @@ class VariationalPromptBank(nn.Module):
         )
 
     def kl_loss(self, channel_indices):
-        def kld(mu, logvar, anchor):
-            return -0.5 * torch.sum(1 + logvar - (mu - anchor).pow(2) - logvar.exp())
+        def kld_with_width(mu, logvar, anchor, target_var=2.0):
+            target_logvar = math.log(target_var)
+            return (
+                0.5
+                * torch.sum(
+                    (target_logvar - logvar)
+                    + (logvar.exp() + (mu - anchor).pow(2)) / target_var
+                    - 1,
+                    dim=-1,
+                ).mean()
+            )
 
-        loss_pe = kld(
+        loss_pe = kld_with_width(
             self.pe_mu[channel_indices],
             self.pe_logvar[channel_indices],
             self.pe_anchor[channel_indices],
         )
-        loss_ppe = kld(
+        loss_ppe = kld_with_width(
             self.ppe_mu[channel_indices],
             self.ppe_logvar[channel_indices],
             self.ppe_anchor[channel_indices],
@@ -345,7 +316,7 @@ def run_epic_generative(config: DictConfig):
     U = create_matrix(config.matrix.type, model_bundle.num_channels, device).to(
         torch.float32
     )
-    mod_head = create_modified_head(base_model, config.model.name, U=U)
+    mod_head = create_modified_head(base_model, config.model.name, U=None)
 
     prompt_bank = VariationalPromptBank(model_bundle.num_channels, pipe, device).to(
         torch.bfloat16
@@ -371,13 +342,16 @@ def run_epic_generative(config: DictConfig):
 
     pbar = tqdm(range(config.training.steps), desc="Learning Concepts")
 
+    CYCLE_LENGTH = config.training.U_steps + config.training.prompt_steps
+
     for step in pbar:
         target_channels = torch.randint(
             0, model_bundle.num_channels, (config.training.batch_size,), device=device
         )
 
-        is_U_update = (step % 5 == 0) or (step < config.training.warmup_steps)
-        U.requires_grad_(is_U_update)
+        is_U_phase = (step % CYCLE_LENGTH) < config.training.U_steps
+        if step < config.training.warmup_steps:
+            is_U_phase = True
 
         pe, ppe, pea, ppea = prompt_bank(target_channels)
 
@@ -390,13 +364,13 @@ def run_epic_generative(config: DictConfig):
                 guidance_scale=config.generative_model.guidance_scale,
                 device=device,
             )
-            imgs_in = F.interpolate(generated_imgs, (224, 224), mode="bilinear")
 
-            feats = backbone((imgs_in.float() - mean) / std)
+        imgs_in = F.interpolate(generated_imgs, (224, 224), mode="bilinear")
+        feats = backbone((imgs_in.float() - mean) / std).to(torch.float32)
 
-        if step < config.training.warmup_steps:
+        if is_U_phase:
             purity_scores, _, _ = epic_purity(
-                feats.detach().to(torch.float32), U().to(torch.float32), target_channels
+                feats.detach(), U(), target_channels
             )
             loss_purity = -config.training.lambda_purity * purity_scores.mean()
             opt_U.zero_grad(set_to_none=True)
@@ -404,24 +378,22 @@ def run_epic_generative(config: DictConfig):
             opt_U.step()
         else:
             purity_scores, _, _ = epic_purity(
-                feats.to(torch.float32), U().to(torch.float32), target_channels
+                feats, U().detach(), target_channels
             )
             loss_purity = -config.training.lambda_purity * purity_scores.mean()
             loss_reg = config.training.lambda_reg * prompt_bank.kl_loss(target_channels)
 
-            diff_i = torch.abs(imgs_in[:, :, :, 1:] - imgs_in[:, :, :, :-1])
-            diff_j = torch.abs(imgs_in[:, :, 1:, :] - imgs_in[:, :, :-1, :])
-            loss_tv = config.training.lambda_tv * (diff_i.mean() + diff_j.mean())
+            logits = mod_head(feats)
+            probs = F.softmax(logits, dim=1)
+            entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean()
+            loss_entropy = config.training.lambda_entropy * entropy
 
-            total_loss = loss_purity + loss_reg + loss_tv
+            total_loss = loss_purity + loss_reg + loss_entropy
 
             opt_prompts.zero_grad(set_to_none=True)
             opt_U.zero_grad(set_to_none=True)
             total_loss.backward()
             opt_prompts.step()
-
-            if is_U_update:
-                opt_U.step()
 
         purity_history.append(purity_scores.mean().item())
 

@@ -23,8 +23,9 @@ training:
   lr_reg: 0.01
   lambda_purity: 10.0
   lambda_reg: 0.01
-  lambda_div: 1.0
-  lambda_tv: 0.01
+  lambda_entropy: 1.0
+  U_steps: 5
+  prompt_steps: 10
 
 explanations:
   top_k: 4
