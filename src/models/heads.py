@@ -27,8 +27,9 @@ class ModifiedHeadBase(torch.nn.Module):
     def _pool_and_flatten(self, x):
         raise NotImplementedError("Subclasses must implement this method.")
 
-    def forward(self, x):
-        x = self._preprocess_input(x)
+    def forward(self, x, preprocess=True):
+        if preprocess:
+            x = self._preprocess_input(x)
         x = self._pool_and_flatten(x)
         return torch.nn.functional.linear(x, self.fc_weight, self.b)
 

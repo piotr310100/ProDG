@@ -316,7 +316,7 @@ def run_epic_generative(config: DictConfig):
     U = create_matrix(config.matrix.type, model_bundle.num_channels, device).to(
         torch.float32
     )
-    mod_head = create_modified_head(base_model, config.model.name, U=None)
+    mod_head = create_modified_head(base_model, config.model.name, U=U)
 
     prompt_bank = VariationalPromptBank(model_bundle.num_channels, pipe, device).to(
         torch.bfloat16
@@ -351,7 +351,7 @@ def run_epic_generative(config: DictConfig):
 
         is_U_phase = (step % CYCLE_LENGTH) < config.training.U_steps
         if step < config.training.warmup_steps:
-            is_U_phase = True
+            is_U_phase = False
 
         pe, ppe, pea, ppea = prompt_bank(target_channels)
 
@@ -369,21 +369,17 @@ def run_epic_generative(config: DictConfig):
         feats = backbone((imgs_in.float() - mean) / std).to(torch.float32)
 
         if is_U_phase:
-            purity_scores, _, _ = epic_purity(
-                feats.detach(), U(), target_channels
-            )
+            purity_scores, _, _ = epic_purity(feats.detach(), U(), target_channels)
             loss_purity = -config.training.lambda_purity * purity_scores.mean()
             opt_U.zero_grad(set_to_none=True)
             loss_purity.backward()
             opt_U.step()
         else:
-            purity_scores, _, _ = epic_purity(
-                feats, U().detach(), target_channels
-            )
+            purity_scores, _, _ = epic_purity(feats, U().detach(), target_channels)
             loss_purity = -config.training.lambda_purity * purity_scores.mean()
             loss_reg = config.training.lambda_reg * prompt_bank.kl_loss(target_channels)
 
-            logits = mod_head(feats)
+            logits = mod_head(feats, preprocess=False)
             probs = F.softmax(logits, dim=1)
             entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean()
             loss_entropy = config.training.lambda_entropy * entropy
