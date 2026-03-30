@@ -1,4 +1,5 @@
 import gc
+import json
 import math
 import os
 import random
@@ -21,6 +22,75 @@ from models import create_backbone_model, create_modified_head
 from prototypes import compute_activation_bbox, pixelwise_multiply, topk_active_channels
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+@torch.no_grad()
+def discover_initial_prompts(config, pipe, backbone, device):
+    with open(config.dataset.class_map_json, "r") as f:
+        class_map = json.load(f)
+
+    class_names = list(class_map.values())
+    dummy_feat = backbone(torch.randn(1, 3, 224, 224).to(device))
+    num_channels = dummy_feat.shape[1]
+
+    best_purities = torch.full((num_channels,), -1.0, device=device)
+    best_names = [""] * num_channels
+
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    backbone.eval()
+    gen_batch_size = config.generative_model.get("discovery_batch_size", 4)
+
+    for i in tqdm(range(0, len(class_names), gen_batch_size), desc="Discovery"):
+        batch_names = class_names[i : i + gen_batch_size]
+
+        with torch.no_grad():
+            pe, ppe, _ = pipe.encode_prompt(
+                prompt=batch_names, prompt_2=None, device=device
+            )
+            gen_imgs = differentiable_flux_generate(
+                pipe,
+                pe,
+                ppe,
+                num_steps=config.generative_model.gen_steps,
+                guidance_scale=config.generative_model.guidance_scale,
+                device=device,
+                seed=config.seed,
+            )
+
+            imgs_in = F.interpolate(gen_imgs, (224, 224), mode="bilinear")
+            feats = backbone((imgs_in.float() - mean) / std).to(torch.float32)
+            B, C, H, W = feats.shape
+
+            flat_feats = feats.view(B, C, -1)
+            max_act, max_idx = torch.max(flat_feats, dim=-1)
+            batch_indices = torch.arange(B, device=device).view(B, 1).expand(B, C)
+            all_channel_vectors = flat_feats[batch_indices, :, max_idx]
+            l2_norms = torch.linalg.norm(all_channel_vectors, dim=-1).clamp_min(1e-8)
+            batch_purities = max_act / l2_norms
+
+            current_best_batch_val, current_best_batch_idx = torch.max(
+                batch_purities, dim=0
+            )
+
+            mask = current_best_batch_val > best_purities
+            best_purities[mask] = current_best_batch_val[mask]
+
+            for ch_idx in torch.where(mask)[0]:
+                img_in_batch_idx = current_best_batch_idx[ch_idx]
+                best_names[ch_idx.item()] = batch_names[img_in_batch_idx]
+
+        torch.cuda.empty_cache()
+
+    print(
+        best_names,
+        best_purities.min().item(),
+        best_purities.mean().item(),
+        best_purities.max().item(),
+    )
+
+    return best_names
 
 
 def get_heatmap(
@@ -142,34 +212,58 @@ def decode_latents(pipeline, latents, height, width):
 
 
 class VariationalPromptBank(nn.Module):
-    def __init__(self, num_channels, pipe, device):
+    def __init__(self, num_channels, pipe, device, initial_prompts: list[str] = None):
         super().__init__()
         self.num_channels = num_channels
         self.device = device
 
-        with torch.no_grad():
-            prompt = ""
-            pe, ppe, _ = pipe.encode_prompt(
-                prompt=[prompt], prompt_2=None, device=device
-            )
+        if initial_prompts is not None:
+            print(f"Encoding {len(initial_prompts)} discovered prompts...")
+            with torch.no_grad():
+                unique_prompts = list(set(initial_prompts))
+                p_to_idx = {p: i for i, p in enumerate(unique_prompts)}
 
-        pe_init = pe.repeat(num_channels, 1, 1)
-        ppe_init = ppe.repeat(num_channels, 1)
+                all_pe, all_ppe = [], []
+                for i in range(0, len(unique_prompts), 8):
+                    batch = unique_prompts[i : i + 8]
+                    pe, ppe, _ = pipe.encode_prompt(
+                        prompt=batch, prompt_2=None, device=device
+                    )
+                    all_pe.append(pe)
+                    all_ppe.append(ppe)
+
+                u_pe = torch.cat(all_pe, dim=0)
+                u_ppe = torch.cat(all_ppe, dim=0)
+
+                indices = torch.tensor(
+                    [p_to_idx[p] for p in initial_prompts], device=device
+                )
+                pe_init = u_pe[indices]
+                ppe_init = u_ppe[indices]
+        else:
+            print("Encoding empty prompts...")
+            with torch.no_grad():
+                prompt = ""
+                pe, ppe, _ = pipe.encode_prompt(
+                    prompt=[prompt], prompt_2=None, device=device
+                )
+                pe_init = pe.repeat(num_channels, 1, 1)
+                ppe_init = ppe.repeat(num_channels, 1)
 
         self.register_buffer("pe_anchor", pe_init.clone())
         self.register_buffer("ppe_anchor", ppe_init.clone())
 
-        self.pe_mu = nn.Parameter(pe_init.clone())
-        self.pe_logvar = nn.Parameter(torch.full_like(pe_init, -2.0))
-        self.ppe_mu = nn.Parameter(ppe_init.clone())
-        self.ppe_logvar = nn.Parameter(torch.full_like(ppe_init, -2.0))
+        self.pe_delta = nn.Parameter(torch.zeros_like(pe_init))
+        self.ppe_delta = nn.Parameter(torch.zeros_like(ppe_init))
+        self.pe_logvar = nn.Parameter(torch.full_like(pe_init, -12.0))
+        self.ppe_logvar = nn.Parameter(torch.full_like(ppe_init, -12.0))
 
     def forward(self, channel_indices):
-        mu = self.pe_mu[channel_indices]
-        std = torch.exp(0.5 * self.pe_logvar[channel_indices])
-        pe = mu + torch.randn_like(std) * std
+        pe_mu = self.pe_anchor[channel_indices] + self.pe_delta[channel_indices]
+        pe_std = torch.exp(0.5 * self.pe_logvar[channel_indices])
+        pe = pe_mu + torch.randn_like(pe_std) * pe_std
 
-        ppe_mu = self.ppe_mu[channel_indices]
+        ppe_mu = self.ppe_anchor[channel_indices] + self.ppe_delta[channel_indices]
         ppe_std = torch.exp(0.5 * self.ppe_logvar[channel_indices])
         ppe = ppe_mu + torch.randn_like(ppe_std) * ppe_std
         return (
@@ -179,31 +273,8 @@ class VariationalPromptBank(nn.Module):
             self.ppe_anchor[channel_indices],
         )
 
-    def kl_loss(self, channel_indices):
-        def kld_with_width(mu, logvar, anchor, target_var=2.0):
-            target_logvar = math.log(target_var)
-            return (
-                0.5
-                * torch.sum(
-                    (target_logvar - logvar)
-                    + (logvar.exp() + (mu - anchor).pow(2)) / target_var
-                    - 1,
-                    dim=-1,
-                ).mean()
-            )
-
-        loss_pe = kld_with_width(
-            self.pe_mu[channel_indices],
-            self.pe_logvar[channel_indices],
-            self.pe_anchor[channel_indices],
-        )
-        loss_ppe = kld_with_width(
-            self.ppe_mu[channel_indices],
-            self.ppe_logvar[channel_indices],
-            self.ppe_anchor[channel_indices],
-        )
-
-        return (loss_pe + loss_ppe) / channel_indices.shape[0]
+    def reg_loss(self, channel_indices):
+        return (self.pe_delta.pow(2).mean() + self.ppe_delta.pow(2).mean())
 
 
 def differentiable_flux_generate(
@@ -313,16 +384,20 @@ def run_epic_generative(config: DictConfig):
     pipe.vae.enable_tiling()
     pipe.vae.enable_slicing()
 
+    initial_prompts = discover_initial_prompts(config, pipe, backbone, device)
+
     U = create_matrix(config.matrix.type, model_bundle.num_channels, device).to(
         torch.float32
     )
     mod_head = create_modified_head(base_model, config.model.name, U=U)
 
-    prompt_bank = VariationalPromptBank(model_bundle.num_channels, pipe, device).to(
-        torch.bfloat16
-    )
+    prompt_bank = VariationalPromptBank(
+        model_bundle.num_channels, pipe, device, initial_prompts
+    ).to(torch.bfloat16)
 
-    opt_prompts = torch.optim.AdamW(prompt_bank.parameters(), lr=config.training.lr_reg)
+    opt_prompts = torch.optim.AdamW(
+        prompt_bank.parameters(), lr=config.training.lr_reg, weight_decay=0.0
+    )
     opt_U = torch.optim.AdamW(U.parameters(), lr=config.training.lr_purity)
 
     purity_history = []
@@ -344,6 +419,8 @@ def run_epic_generative(config: DictConfig):
 
     CYCLE_LENGTH = config.training.U_steps + config.training.prompt_steps
 
+    set_seeds(config.seed)
+
     for step in pbar:
         target_channels = torch.randint(
             0, model_bundle.num_channels, (config.training.batch_size,), device=device
@@ -351,7 +428,7 @@ def run_epic_generative(config: DictConfig):
 
         is_U_phase = (step % CYCLE_LENGTH) < config.training.U_steps
         if step < config.training.warmup_steps:
-            is_U_phase = False
+            is_U_phase = True
 
         pe, ppe, pea, ppea = prompt_bank(target_channels)
 
@@ -377,18 +454,27 @@ def run_epic_generative(config: DictConfig):
         else:
             purity_scores, _, _ = epic_purity(feats, U().detach(), target_channels)
             loss_purity = -config.training.lambda_purity * purity_scores.mean()
-            loss_reg = config.training.lambda_reg * prompt_bank.kl_loss(target_channels)
+            if config.training.lambda_reg != 0:
+                loss_reg = config.training.lambda_reg * prompt_bank.reg_loss(
+                    target_channels
+                )
+            else:
+                loss_reg = 0.0
 
-            logits = mod_head(feats, preprocess=False)
-            probs = F.softmax(logits, dim=1)
-            entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean()
-            loss_entropy = config.training.lambda_entropy * entropy
+            if config.training.lambda_entropy != 0:
+                logits = mod_head(feats, preprocess=False)
+                probs = F.softmax(logits, dim=1)
+                entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean()
+                loss_entropy = config.training.lambda_entropy * entropy
+            else:
+                loss_entropy = 0.0
 
             total_loss = loss_purity + loss_reg + loss_entropy
 
             opt_prompts.zero_grad(set_to_none=True)
             opt_U.zero_grad(set_to_none=True)
             total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(prompt_bank.parameters(), 1.0)
             opt_prompts.step()
 
         purity_history.append(purity_scores.mean().item())

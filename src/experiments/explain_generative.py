@@ -15,67 +15,12 @@ from data import create_indexed_dataloader
 from experiments.epic_generative_learnable import (
     VariationalPromptBank,
     differentiable_flux_generate,
+    get_heatmap,
     set_seeds,
 )
 from matrix import create_matrix
 from models import create_backbone_model, create_modified_head
 from prototypes import compute_activation_bbox, pixelwise_multiply, topk_active_channels
-
-
-def get_heatmap(
-    model: nn.Module,
-    modified_head: nn.Module,
-    images: torch.Tensor,
-    batch_size: int = 1,
-    device: torch.device | str = "cuda",
-    threshold: float = 0.1,
-) -> np.ndarray:
-    """
-    Generates heatmaps for given images based on the activations of the last
-    convolutional layer of a neural network model.
-    """
-
-    def process_batch(batch):
-        image = batch.to(device, non_blocking=True)
-        I = model(image)
-        lts = modified_head(I)
-        outs = modified_head._preprocess_input(I)
-        y = torch.argmax(lts, dim=1)
-        return lts, outs, y
-
-    with torch.inference_mode():
-        weight = modified_head.fc_weight.to(device)
-        results = map(process_batch, torch.split(images, batch_size, dim=0))
-        logits, last_conv, y_pred = zip(*results)
-
-        logits = torch.cat(logits, dim=0)
-        last_conv = torch.cat(last_conv, dim=0)
-        y_pred = torch.cat(y_pred, dim=0)
-
-        heatmap = torch.einsum("bi,biwh->biwh", weight[y_pred], last_conv)
-        mask = (heatmap.abs() > 0).float()
-        if modified_head.b is not None:
-            heatmap = heatmap + modified_head.b[y_pred].view(-1, 1, 1, 1).div(
-                last_conv.shape[1]
-            )
-        heatmap = heatmap * mask
-
-        heatmap = heatmap / torch.flatten(heatmap, start_dim=1, end_dim=-1).abs().max(
-            dim=-1
-        ).values.view(-1, 1, 1, 1)
-        heatmap = F.relu(heatmap)
-        heatmap_rescaled = (
-            F.interpolate(
-                heatmap,
-                images.shape[-2:],
-                mode="bilinear",
-            )
-            .detach()
-            .cpu()
-            .numpy()
-        )
-
-    return heatmap_rescaled
 
 
 def explain_predictions(config: DictConfig):

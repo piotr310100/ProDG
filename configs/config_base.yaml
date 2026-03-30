@@ -10,6 +10,7 @@ model:
 dataset:
   datapath_train: data/cub200_full/train
   datapath_val: data/cub200_full/val
+  class_map_json: class_id_to_name/imagenet.json
 
 dataloader:
   batch_size: 256
