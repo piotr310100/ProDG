@@ -475,10 +475,9 @@ def run_epic_generative(config: DictConfig):
 
                 hm_c = hm_orig[0, ch]
                 hm_c_norm = hm_c / (np.max(hm_c) + 1e-8)
-                alpha_c = np.where(hm_c_norm > 0.05, 0.5, 0.0)
 
                 axes_overlay[row, 0].imshow(np.array(orig_pil))
-                axes_overlay[row, 0].imshow(hm_c_norm, cmap="jet", alpha=alpha_c)
+                axes_overlay[row, 0].imshow(hm_c_norm, cmap="jet", alpha=0.6)
                 axes_overlay[row, 0].set_ylabel(
                     f"Channel {ch}", fontsize=14, fontweight="bold"
                 )
@@ -555,11 +554,10 @@ def run_epic_generative(config: DictConfig):
                     )
 
                     hm_p_c_norm = hm_p_c_resized / (np.max(hm_p_c_resized) + 1e-8)
-                    alpha_p = np.where(hm_p_c_norm > 0.05, 0.5, 0.0)
 
                     axes_overlay[row, col + 1].imshow(np.array(proto_pil))
                     axes_overlay[row, col + 1].imshow(
-                        hm_p_c_norm, cmap="jet", alpha=alpha_p
+                        hm_p_c_norm, cmap="jet", alpha=0.6
                     )
                     axes_overlay[row, col + 1].axis("off")
 
