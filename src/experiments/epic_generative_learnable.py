@@ -99,75 +99,26 @@ def get_heatmap(
     images: torch.Tensor,
     batch_size: int = 1,
     device: torch.device | str = "cuda",
-    threshold: float = 0.1,
 ) -> np.ndarray:
-    """
-    Generates heatmaps for given images based on the activations of the last
-    convolutional layer of a neural network model.
-
-    Args:
-        model (nn.Module): The neural network model.
-        images (Tensor): Input images.
-        batch_size (int): Batch size for processing images.
-        device (torch.device | str): Device to use for computation.
-        threshold (float, optional): Threshold for heatmap visualization from range (0, 0.5). Defaults to 0.1.
-
-    Returns:
-        np.ndarray: Rescaled heatmap array interpolated to the input image size.
-    """
-
-    def process_batch(batch):
-        """
-        Process a batch of images through the model.
-
-        Args:
-            batch (Tensor): Batch of images.
-
-        Returns:
-            tuple: Tuple containing:
-                - Tensor: Logits.
-                - Tensor: Last convolutional layer activations.
-                - Tensor: Predicted labels.
-        """
-        image = batch.to(device, non_blocking=True)
-        I = model(image)
-        lts = modified_head(I)
-        outs = modified_head._preprocess_input(I)
-        y = torch.argmax(lts, dim=1)
-        return lts, outs, y
-
+    # TODO: Add weighing to the box selection?
     with torch.inference_mode():
-        weight = modified_head.fc_weight.to(device)
-        # Process images in batches
-        results = map(process_batch, torch.split(images, batch_size, dim=0))
-        logits, last_conv, y_pred = zip(*results)
+        image = images.to(device)
+        concepts = modified_head._preprocess_input(model(image))
+        concepts_relu = torch.nn.functional.relu(concepts)
 
-        # Concatenate results
-        logits = torch.cat(logits, dim=0)
-        last_conv = torch.cat(last_conv, dim=0)
-        y_pred = torch.cat(y_pred, dim=0)
+        pixel_norms = torch.linalg.norm(concepts, dim=1, keepdim=True)
+        purity = concepts_relu / (pixel_norms + 1e-8)
 
-        # Generate heatmap
-        heatmap = torch.einsum("bi,biwh->biwh", weight[y_pred], last_conv)
-        mask = (heatmap.abs() > 0).float()
-        if modified_head.b is not None:
-            heatmap = heatmap + modified_head.b[y_pred].view(-1, 1, 1, 1).div(
-                last_conv.shape[1]
-            )
-        heatmap = heatmap * mask
+        B, C, H, W = concepts_relu.shape
+        ch_max = concepts_relu.view(B, C, -1).max(dim=-1).values.view(B, C, 1, 1)
+        magnitude = concepts_relu / (ch_max + 1e-8)
 
-        # Normalize the heatmap for visualization
-        heatmap = heatmap / torch.flatten(heatmap, start_dim=1, end_dim=-1).abs().max(
-            dim=-1
-        ).values.view(-1, 1, 1, 1)  # changing value to [-1, 1]
-        heatmap = F.relu(heatmap)  # only positive values
+        heatmap = purity * magnitude
+
         heatmap_rescaled = (
-            F.interpolate(
-                heatmap,
-                images.shape[-2:],
-                mode="bilinear",
+            torch.nn.functional.interpolate(
+                heatmap, images.shape[-2:], mode="bilinear", align_corners=False
             )
-            .detach()
             .cpu()
             .numpy()
         )
@@ -274,7 +225,7 @@ class VariationalPromptBank(nn.Module):
         )
 
     def reg_loss(self, channel_indices):
-        return (self.pe_delta.pow(2).mean() + self.ppe_delta.pow(2).mean())
+        return self.pe_delta.pow(2).mean() + self.ppe_delta.pow(2).mean()
 
 
 def differentiable_flux_generate(
@@ -461,15 +412,7 @@ def run_epic_generative(config: DictConfig):
             else:
                 loss_reg = 0.0
 
-            if config.training.lambda_entropy != 0:
-                logits = mod_head(feats, preprocess=False)
-                probs = F.softmax(logits, dim=1)
-                entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean()
-                loss_entropy = config.training.lambda_entropy * entropy
-            else:
-                loss_entropy = 0.0
-
-            total_loss = loss_purity + loss_reg + loss_entropy
+            total_loss = loss_purity + loss_reg
 
             opt_prompts.zero_grad(set_to_none=True)
             opt_U.zero_grad(set_to_none=True)
