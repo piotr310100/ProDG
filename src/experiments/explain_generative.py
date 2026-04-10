@@ -62,9 +62,7 @@ def explain_predictions(config: DictConfig):
     U.load_state_dict(torch.load(u_path, map_location=device))
     U.eval()
 
-    prompt_bank = VariationalPromptBank(model_bundle.num_channels, pipe, device).to(
-        torch.bfloat16
-    )
+    prompt_bank = VariationalPromptBank(model_bundle.num_channels, pipe, device)
     prompt_path = os.path.join(checkpoint_dir, "learned_prompts.pt")
     if not os.path.exists(prompt_path):
         raise FileNotFoundError(f"Could not find learned prompts at {prompt_path}")
@@ -160,9 +158,9 @@ def explain_predictions(config: DictConfig):
                 axes_overlay[row, 0].set_yticks([])
 
                 ch_tensor = torch.tensor([ch] * 5, device=device)
-                pe, ppe, _, _ = prompt_bank(ch_tensor)
 
                 with torch.autocast("cuda", dtype=torch.bfloat16):
+                    pe, ppe, _, _ = prompt_bank(ch_tensor)
                     ex_imgs_t = differentiable_flux_generate(
                         pipe,
                         pe,

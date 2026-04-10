@@ -163,7 +163,7 @@ def decode_latents(pipeline, latents, height, width):
 
 
 class VariationalPromptBank(nn.Module):
-    def __init__(self, num_channels, pipe, device, initial_prompts: list[str] = None):
+    def __init__(self, num_channels, pipe, device, initial_prompts: list[str] = None, rank = 128):
         super().__init__()
         self.num_channels = num_channels
         self.device = device
@@ -204,13 +204,18 @@ class VariationalPromptBank(nn.Module):
         self.register_buffer("pe_anchor", pe_init.clone())
         self.register_buffer("ppe_anchor", ppe_init.clone())
 
-        self.pe_delta = nn.Parameter(torch.zeros_like(pe_init))
-        self.ppe_delta = nn.Parameter(torch.zeros_like(ppe_init))
-        self.pe_logvar = nn.Parameter(torch.full_like(pe_init, -12.0))
+        self.pe_lora_A = nn.Parameter(torch.zeros(num_channels, 512, rank, device=device))
+        self.pe_lora_B = nn.Parameter(torch.zeros(num_channels, rank, 4096, device=device))
+
+        self.ppe_delta = nn.Parameter(torch.zeros_like(ppe_init) * 0.1)
+        self.pe_logvar = nn.Parameter(torch.full((num_channels, 512, 1), -12.0, device=device))
         self.ppe_logvar = nn.Parameter(torch.full_like(ppe_init, -12.0))
 
     def forward(self, channel_indices):
-        pe_mu = self.pe_anchor[channel_indices] + self.pe_delta[channel_indices]
+        A = self.pe_lora_A[channel_indices]
+        B = self.pe_lora_B[channel_indices]
+        delta = torch.bmm(A, B)
+        pe_mu = self.pe_anchor[channel_indices] + delta
         pe_std = torch.exp(0.5 * self.pe_logvar[channel_indices])
         pe = pe_mu + torch.randn_like(pe_std) * pe_std
 
@@ -225,7 +230,9 @@ class VariationalPromptBank(nn.Module):
         )
 
     def reg_loss(self, channel_indices):
-        return self.pe_delta.pow(2).mean() + self.ppe_delta.pow(2).mean()
+        return self.pe_lora_A[channel_indices].pow(2).mean() + \
+               self.pe_lora_B[channel_indices].pow(2).mean() + \
+               self.ppe_delta[channel_indices].pow(2).mean()
 
 
 def differentiable_flux_generate(
@@ -344,7 +351,7 @@ def run_epic_generative(config: DictConfig):
 
     prompt_bank = VariationalPromptBank(
         model_bundle.num_channels, pipe, device, initial_prompts
-    ).to(torch.bfloat16)
+    )
 
     opt_prompts = torch.optim.AdamW(
         prompt_bank.parameters(), lr=config.training.lr_reg, weight_decay=0.0
@@ -381,9 +388,9 @@ def run_epic_generative(config: DictConfig):
         if step < config.training.warmup_steps:
             is_U_phase = True
 
-        pe, ppe, pea, ppea = prompt_bank(target_channels)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
+            pe, ppe, _, _ = prompt_bank(target_channels)
             generated_imgs = differentiable_flux_generate(
                 pipe,
                 pe,
@@ -420,6 +427,7 @@ def run_epic_generative(config: DictConfig):
             torch.nn.utils.clip_grad_norm_(prompt_bank.parameters(), 1.0)
             opt_prompts.step()
 
+        torch.cuda.empty_cache()
         purity_history.append(purity_scores.mean().item())
 
         if step % 200 == 0 or (step + 1) == config.training.steps:
@@ -487,17 +495,18 @@ def run_epic_generative(config: DictConfig):
                 ch_tensor = torch.tensor([ch] * 5, device=device)
 
                 with torch.no_grad():
-                    pe_vis, ppe_vis, _, _ = prompt_bank(ch_tensor)
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pe_vis, ppe_vis, _, _ = prompt_bank(ch_tensor)
 
-                    ex_imgs_t = differentiable_flux_generate(
-                        pipe,
-                        pe_vis,
-                        ppe_vis,
-                        num_steps=config.generative_model.gen_steps,
-                        guidance_scale=config.generative_model.guidance_scale,
-                        device=device,
-                    )
-                    ex_imgs = ex_imgs_t.float().cpu().permute(0, 2, 3, 1).numpy()
+                        ex_imgs_t = differentiable_flux_generate(
+                            pipe,
+                            pe_vis,
+                            ppe_vis,
+                            num_steps=config.generative_model.gen_steps,
+                            guidance_scale=config.generative_model.guidance_scale,
+                            device=device,
+                        )
+                        ex_imgs = ex_imgs_t.float().cpu().permute(0, 2, 3, 1).numpy()
 
                 for col in range(5):
                     proto_t = (
