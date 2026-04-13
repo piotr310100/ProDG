@@ -23,9 +23,9 @@ training:
   lr_reg: 0.0001
   lambda_purity: 1.0
   lambda_reg: 0.1
-  lambda_diversity: 0.5
+  lambda_diversity: 0.0
   U_steps: 5
-  prompt_steps: 10
+  prompt_steps: 5
   prompt_init: "empty"
   num_additional_gen_imgs: 2
 

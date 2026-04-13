@@ -162,12 +162,12 @@ def decode_latents(pipeline, latents, height, width):
 
 
 class VariationalPromptBank(nn.Module):
-    def __init__(self, num_channels, pipe, device, initial_prompts: list[str] = None, rank = 128):
+    def __init__(self, num_channels, pipe, device, init_mode="data", initial_prompts: list[str] = None, rank=128):
         super().__init__()
         self.num_channels = num_channels
         self.device = device
 
-        if initial_prompts is not None:
+        if init_mode == "data" and initial_prompts is not None:
             print(f"Encoding {len(initial_prompts)} discovered prompts...")
             with torch.no_grad():
                 unique_prompts = list(set(initial_prompts))
@@ -190,7 +190,8 @@ class VariationalPromptBank(nn.Module):
                 )
                 pe_init = u_pe[indices]
                 ppe_init = u_ppe[indices]
-        else:
+
+        elif init_mode == "empty":
             print("Encoding empty prompts...")
             with torch.no_grad():
                 prompt = ""
@@ -199,6 +200,21 @@ class VariationalPromptBank(nn.Module):
                 )
                 pe_init = pe.repeat(num_channels, 1, 1)
                 ppe_init = ppe.repeat(num_channels, 1)
+
+        elif init_mode == "random":
+            print("Initializing random prompts...")
+            with torch.no_grad():
+                pe_sample, ppe_sample, _ = pipe.encode_prompt(
+                    prompt=[""], prompt_2=None, device=device
+                )
+                pe_shape = (num_channels,) + pe_sample.shape[1:]
+                ppe_shape = (num_channels,) + ppe_sample.shape[1:]
+
+                pe_init = torch.randn(pe_shape, device=device) * 0.02
+                ppe_init = torch.randn(ppe_shape, device=device) * 0.02
+
+        else:
+            raise ValueError("Invalid init_mode")
 
         self.register_buffer("pe_anchor", pe_init.clone())
         self.register_buffer("ppe_anchor", ppe_init.clone())
@@ -309,6 +325,16 @@ def differentiable_flux_generate(
     final_img = decode_latents(pipe, latents, height, width)
     return (final_img / 2 + 0.5).clamp(0, 1)
 
+def cosine_diversity(images):
+    """
+    images: [K,3,H,W], K - liczba przykładów w danym kanale
+    """
+    K = images.shape[0]
+    flat = images.view(K, -1)
+    flat = F.normalize(flat, dim=1)
+    sim = flat @ flat.T
+    mask = ~torch.eye(K, dtype=torch.bool, device=images.device)
+    return sim[mask].mean()
 
 def run_epic_generative(config: DictConfig):
     set_seeds(config.seed)
@@ -354,8 +380,7 @@ def run_epic_generative(config: DictConfig):
     mod_head = create_modified_head(base_model, config.model.name, U=U)
 
     prompt_bank = VariationalPromptBank(
-        model_bundle.num_channels, pipe, device, initial_prompts
-    )
+        model_bundle.num_channels, pipe, device, config.training.prompt_init, initial_prompts)
 
     opt_prompts = torch.optim.AdamW(
         prompt_bank.parameters(), lr=config.training.lr_reg, weight_decay=0.0
@@ -418,14 +443,42 @@ def run_epic_generative(config: DictConfig):
         else:
             purity_scores, _, _ = epic_purity(feats, U().detach(), target_channels)
             loss_purity = -config.training.lambda_purity * purity_scores.mean()
-            if config.training.lambda_reg != 0:
+            if config.training.lambda_reg > 0:
                 loss_reg = config.training.lambda_reg * prompt_bank.reg_loss(
                     target_channels
                 )
             else:
                 loss_reg = 0.0
 
-            total_loss = loss_purity + loss_reg
+            if config.training.lambda_diversity > 0:
+                K = config.training.num_additional_gen_imgs
+                B = target_channels.shape[0]
+                div_channels = target_channels.repeat_interleave(K)
+
+                pe_div, ppe_div, _, _ = prompt_bank(div_channels)
+
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    imgs_div = differentiable_flux_generate(
+                        pipe,
+                        pe_div,
+                        ppe_div,
+                        num_steps=config.generative_model.gen_steps,
+                        guidance_scale=config.generative_model.guidance_scale,
+                        device=device,
+                    )
+
+                imgs_div = F.interpolate(imgs_div, (64, 64), mode="bilinear")
+                imgs_div = imgs_div.view(B, K, *imgs_div.shape[1:])
+
+                loss_div = 0.0
+                for b in range(B):
+                    loss_div += cosine_diversity(imgs_div[b])
+
+                loss_div = (config.training.lambda_diversity * loss_div) / B
+            else:
+                loss_div = 0
+
+            total_loss = loss_purity + loss_reg + loss_div
 
             opt_prompts.zero_grad(set_to_none=True)
             opt_U.zero_grad(set_to_none=True)
