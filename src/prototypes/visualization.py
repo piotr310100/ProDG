@@ -11,6 +11,12 @@ from .utils import pixelwise_multiply, unnormalize
 
 
 def compute_activation_bbox(channel_activation, orig_size):
+    max_val = channel_activation.max()
+    z = torch.tensor(0)
+
+    if max_val <= 1e-8:
+        return z, z, z, z
+
     max_idx = torch.argmax(
         channel_activation.view(channel_activation.size(0), -1), dim=-1
     )
@@ -23,6 +29,65 @@ def compute_activation_bbox(channel_activation, orig_size):
     x_end = ((max_x + 1).float() * scale_w).long()
     return x_start, y_start, x_end, y_end
 
+def compute_activation_bbox_generative(heatmap_tensor, orig_size, threshold_ratio=0.8):
+    h, w = heatmap_tensor.size(-2), heatmap_tensor.size(-1)
+
+    max_val = heatmap_tensor.max()
+    z = torch.tensor(0)
+
+    if max_val <= 1e-8:
+        return z, z, z, z
+
+    normalized_hm = heatmap_tensor / max_val
+    mask = (normalized_hm > threshold_ratio).squeeze(0)
+
+    active_points = set(tuple(x) for x in torch.nonzero(mask).tolist())
+
+    if not active_points:
+        return z, z, z, z
+
+    dirs = [(-1, -1), (-1, 0), (-1, 1),
+            (0, -1),           (0, 1),
+            (1, -1),  (1, 0),  (1, 1)]
+
+    visited = set()
+    largest_blob = []
+
+    for p in active_points:
+        if p not in visited:
+            queue = [p]
+            current_blob = []
+            visited.add(p)
+
+            while queue:
+                curr = queue.pop(0)
+                current_blob.append(curr)
+                y, x = curr
+
+                for dy, dx in dirs:
+                    neighbor = (y + dy, x + dx)
+                    if neighbor in active_points and neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+
+            if len(current_blob) > len(largest_blob):
+                largest_blob = current_blob
+
+    if not largest_blob:
+        return z, z, z, z
+
+    blob_tensor = torch.tensor(largest_blob)
+    min_y, min_x = blob_tensor.min(dim=0)[0].float()
+    max_y, max_x = blob_tensor.max(dim=0)[0].float()
+
+    scale_h, scale_w = orig_size[0] / h, orig_size[1] / w
+
+    y_start = min_y * scale_h
+    y_end = (max_y + 1) * scale_h
+    x_start = min_x * scale_w
+    x_end = (max_x + 1) * scale_w
+
+    return x_start, y_start, x_end, y_end
 
 @torch.no_grad
 def get_visualized_prototypes(

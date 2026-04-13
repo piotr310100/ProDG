@@ -19,7 +19,7 @@ from tqdm import tqdm
 from data import create_indexed_dataloader
 from matrix import create_matrix
 from models import create_backbone_model, create_modified_head
-from prototypes import compute_activation_bbox, pixelwise_multiply, topk_active_channels
+from prototypes import compute_activation_bbox_generative, pixelwise_multiply, topk_active_channels
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -61,6 +61,7 @@ def discover_initial_prompts(config, pipe, backbone, device):
 
             imgs_in = F.interpolate(gen_imgs, (224, 224), mode="bilinear")
             feats = backbone((imgs_in.float() - mean) / std).to(torch.float32)
+            feats = F.relu(feats)
             B, C, H, W = feats.shape
 
             flat_feats = feats.view(B, C, -1)
@@ -84,10 +85,7 @@ def discover_initial_prompts(config, pipe, backbone, device):
         torch.cuda.empty_cache()
 
     print(
-        best_names,
-        best_purities.min().item(),
-        best_purities.mean().item(),
-        best_purities.max().item(),
+        f"Discovery Finished. Mean Purity: {best_purities.mean().item():.4f}, Max: {best_purities.max().item():.4f}"
     )
 
     return best_names
@@ -136,9 +134,9 @@ def set_seeds(seed):
 def epic_purity(features, U, target_channels):
     B, C, H, W = features.shape
     rotated = pixelwise_multiply(features, U)
+    rotated_relu = torch.nn.functional.relu(rotated)
     batch_indices = torch.arange(B, device=features.device)
-    target_map = rotated[batch_indices, target_channels]
-
+    target_map = rotated_relu[batch_indices, target_channels]
     flat_map = target_map.view(B, -1)
     max_act, max_idx = torch.max(flat_map, dim=-1)
 
@@ -230,9 +228,14 @@ class VariationalPromptBank(nn.Module):
         )
 
     def reg_loss(self, channel_indices):
-        return self.pe_lora_A[channel_indices].pow(2).mean() + \
-               self.pe_lora_B[channel_indices].pow(2).mean() + \
-               self.ppe_delta[channel_indices].pow(2).mean()
+        A = self.pe_lora_A[channel_indices]
+        B = self.pe_lora_B[channel_indices]
+        pe_delta = torch.bmm(A, B)
+
+        pe_dist = pe_delta.pow(2).mean()
+        ppe_dist = self.ppe_delta[channel_indices].pow(2).mean()
+
+        return pe_dist + ppe_dist
 
 
 def differentiable_flux_generate(
@@ -388,20 +391,22 @@ def run_epic_generative(config: DictConfig):
         if step < config.training.warmup_steps:
             is_U_phase = True
 
+        with torch.set_grad_enabled(not is_U_phase):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                pe, ppe, _, _ = prompt_bank(target_channels)
+                generated_imgs = differentiable_flux_generate(
+                    pipe,
+                    pe,
+                    ppe,
+                    num_steps=config.generative_model.gen_steps,
+                    guidance_scale=config.generative_model.guidance_scale,
+                    device=device,
+                )
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            pe, ppe, _, _ = prompt_bank(target_channels)
-            generated_imgs = differentiable_flux_generate(
-                pipe,
-                pe,
-                ppe,
-                num_steps=config.generative_model.gen_steps,
-                guidance_scale=config.generative_model.guidance_scale,
-                device=device,
-            )
+                imgs_in = F.interpolate(generated_imgs, (224, 224), mode="bilinear")
+                feats = backbone((imgs_in - mean) / std)
 
-        imgs_in = F.interpolate(generated_imgs, (224, 224), mode="bilinear")
-        feats = backbone((imgs_in.float() - mean) / std).to(torch.float32)
+        feats = feats.to(torch.float32)
 
         if is_U_phase:
             purity_scores, _, _ = epic_purity(feats.detach(), U(), target_channels)
@@ -427,10 +432,9 @@ def run_epic_generative(config: DictConfig):
             torch.nn.utils.clip_grad_norm_(prompt_bank.parameters(), 1.0)
             opt_prompts.step()
 
-        torch.cuda.empty_cache()
         purity_history.append(purity_scores.mean().item())
 
-        if step % 200 == 0 or (step + 1) == config.training.steps:
+        if step % 500 == 0 or (step + 1) == config.training.steps:
             plt.figure(figsize=(10, 6))
             plt.plot(purity_history, color="tab:blue")
             plt.title(f"EPIC Purity Progress (Iter {step + 1})")
@@ -446,15 +450,8 @@ def run_epic_generative(config: DictConfig):
             img_v_cuda = img_v.to(device)
 
             with torch.no_grad():
-                img_v_norm = (img_v_cuda - mean) / std
-                v_feats_raw = backbone(img_v_norm)
-                v_feats_rot = pixelwise_multiply(
-                    v_feats_raw.to(torch.float32),
-                    U().to(torch.float32),
-                )
-
                 hm_orig = get_heatmap(
-                    backbone, mod_head, img_v_norm, batch_size=1, device=device
+                    backbone, mod_head, img_v_cuda, batch_size=1, device=device
                 )
 
             top_ch = topk_active_channels(
@@ -465,30 +462,31 @@ def run_epic_generative(config: DictConfig):
 
             for row, ch in enumerate(top_ch):
                 orig_img_tensor = (img_v_cuda[0].cpu() * s_3d + m_3d).clip(0, 1)
-                orig_pil = to_pil_image(orig_img_tensor)
-                x1, y1, x2, y2 = compute_activation_bbox(
-                    v_feats_rot[0, ch].unsqueeze(0),
+
+                orig_pil_bbox = to_pil_image(orig_img_tensor)
+                x1, y1, x2, y2 = compute_activation_bbox_generative(
+                    torch.from_numpy(hm_orig[0, ch]).unsqueeze(0),
                     (orig_img_tensor.shape[1], orig_img_tensor.shape[2]),
                 )
-                ImageDraw.Draw(orig_pil).rectangle(
-                    [x1.item(), y1.item(), x2.item() - 1, y2.item() - 1],
-                    outline=(255, 255, 0),
-                    width=3,
-                )
+                if x2 > x1 and y2 > y1:
+                    ImageDraw.Draw(orig_pil_bbox).rectangle(
+                        [x1.item(), y1.item(), x2.item() - 1, y2.item() - 1],
+                        outline=(255, 255, 0),
+                        width=3,
+                    )
 
-                axes[row, 0].imshow(np.array(orig_pil))
+                axes[row, 0].imshow(np.array(orig_pil_bbox))
                 axes[row, 0].set_ylabel(f"Channel {ch}", fontsize=14, fontweight="bold")
                 axes[row, 0].set_xticks([])
                 axes[row, 0].set_yticks([])
 
+                orig_pil_clean = to_pil_image(orig_img_tensor)
                 hm_c = hm_orig[0, ch]
                 hm_c_norm = hm_c / (np.max(hm_c) + 1e-8)
 
-                axes_overlay[row, 0].imshow(np.array(orig_pil))
+                axes_overlay[row, 0].imshow(np.array(orig_pil_clean))
                 axes_overlay[row, 0].imshow(hm_c_norm, cmap="jet", alpha=0.6)
-                axes_overlay[row, 0].set_ylabel(
-                    f"Channel {ch}", fontsize=14, fontweight="bold"
-                )
+                axes_overlay[row, 0].set_ylabel(f"Channel {ch}", fontsize=14, fontweight="bold")
                 axes_overlay[row, 0].set_xticks([])
                 axes_overlay[row, 0].set_yticks([])
 
@@ -506,12 +504,11 @@ def run_epic_generative(config: DictConfig):
                             guidance_scale=config.generative_model.guidance_scale,
                             device=device,
                         )
-                        ex_imgs = ex_imgs_t.float().cpu().permute(0, 2, 3, 1).numpy()
+                        ex_imgs = ex_imgs_t.float().cpu()
 
                 for col in range(5):
                     proto_t = (
-                        torch.from_numpy(ex_imgs[col])
-                        .permute(2, 0, 1)
+                        ex_imgs[col]
                         .unsqueeze(0)
                         .to(device, torch.float32)
                     )
@@ -519,12 +516,6 @@ def run_epic_generative(config: DictConfig):
 
                     with torch.no_grad():
                         proto_in_norm = (proto_in - mean) / std
-                        proto_feats = backbone(proto_in_norm)
-                        proto_rot = pixelwise_multiply(
-                            proto_feats.to(torch.float32),
-                            U().to(torch.float32),
-                        )
-
                         hm_proto = get_heatmap(
                             backbone,
                             mod_head,
@@ -533,21 +524,25 @@ def run_epic_generative(config: DictConfig):
                             device=device,
                         )
 
-                    px1, py1, px2, py2 = compute_activation_bbox(
-                        proto_rot[0, ch].unsqueeze(0), (224, 224)
+                    px1, py1, px2, py2 = compute_activation_bbox_generative(
+                        torch.from_numpy(hm_proto[0, ch]).unsqueeze(0), (224, 224)
                     )
 
-                    proto_pil = to_pil_image(
-                        torch.from_numpy(ex_imgs[col]).permute(2, 0, 1)
+                    proto_pil_bbox = to_pil_image(
+                        ex_imgs[col]
                     )
-                    ImageDraw.Draw(proto_pil).rectangle(
-                        [px1.item(), py1.item(), px2.item() - 1, py2.item() - 1],
-                        outline=(255, 255, 0),
-                        width=3,
-                    )
-
-                    axes[row, col + 1].imshow(np.array(proto_pil))
+                    if px2 > px1 and py2 > py1:
+                        ImageDraw.Draw(proto_pil_bbox).rectangle(
+                            [px1.item(), py1.item(), px2.item() - 1, py2.item() - 1],
+                            outline=(255, 255, 0),
+                            width=3,
+                        )
+                    axes[row, col + 1].imshow(np.array(proto_pil_bbox))
                     axes[row, col + 1].axis("off")
+
+                    proto_pil_clean = to_pil_image(
+                        ex_imgs[col]
+                    )
 
                     hm_p_c = hm_proto[0, ch]
                     hm_p_c_tensor = torch.from_numpy(hm_p_c).unsqueeze(0).unsqueeze(0)
@@ -564,10 +559,8 @@ def run_epic_generative(config: DictConfig):
 
                     hm_p_c_norm = hm_p_c_resized / (np.max(hm_p_c_resized) + 1e-8)
 
-                    axes_overlay[row, col + 1].imshow(np.array(proto_pil))
-                    axes_overlay[row, col + 1].imshow(
-                        hm_p_c_norm, cmap="jet", alpha=0.6
-                    )
+                    axes_overlay[row, col + 1].imshow(np.array(proto_pil_clean))
+                    axes_overlay[row, col + 1].imshow(hm_p_c_norm, cmap="jet", alpha=0.6)
                     axes_overlay[row, col + 1].axis("off")
 
             fig.tight_layout()
@@ -589,7 +582,7 @@ def run_epic_generative(config: DictConfig):
         if step % 5 == 0:
             pbar.set_postfix({"purity": f"{purity_scores.mean().item():.4f}"})
 
-        if step % 200 == 0:
+        if step % 500 == 0:
             U.save_state(config.output_path, f"{config.matrix.type}.pt")
             torch.save(
                 prompt_bank.state_dict(),

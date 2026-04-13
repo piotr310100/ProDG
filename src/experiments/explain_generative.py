@@ -20,7 +20,7 @@ from experiments.epic_generative_learnable import (
 )
 from matrix import create_matrix
 from models import create_backbone_model, create_modified_head
-from prototypes import compute_activation_bbox, pixelwise_multiply, topk_active_channels
+from prototypes import compute_activation_bbox_generative, pixelwise_multiply, topk_active_channels
 
 
 def explain_predictions(config: DictConfig):
@@ -92,16 +92,10 @@ def explain_predictions(config: DictConfig):
                 break
 
             img_v_cuda = img_v.to(device)
-            img_v_norm = (img_v_cuda - mean) / std
-
-            v_feats_raw = backbone(img_v_norm)
-            v_feats_rot = pixelwise_multiply(
-                v_feats_raw.to(torch.float32), U().to(torch.float32)
-            )
 
             # Fetch heatmap values for the entire original image across all channels
             hm_orig = get_heatmap(
-                backbone, mod_head, img_v_norm, batch_size=1, device=device
+                backbone, mod_head, img_v_cuda, batch_size=1, device=device
             )
 
             top_ch = topk_active_channels(
@@ -126,34 +120,31 @@ def explain_predictions(config: DictConfig):
 
             for row, ch in enumerate(top_ch):
                 orig_img_tensor = (img_v_cuda[0].cpu() * s_3d + m_3d).clip(0, 1)
-                orig_pil = to_pil_image(orig_img_tensor)
 
-                x1, y1, x2, y2 = compute_activation_bbox(
-                    v_feats_rot[0, ch].unsqueeze(0),
+                orig_pil_bbox = to_pil_image(orig_img_tensor)
+                x1, y1, x2, y2 = compute_activation_bbox_generative(
+                    torch.from_numpy(hm_orig[0, ch]).unsqueeze(0),
                     (orig_img_tensor.shape[1], orig_img_tensor.shape[2]),
                 )
+                if x2 > x1 and y2 > y1:
+                    ImageDraw.Draw(orig_pil_bbox).rectangle(
+                        [x1.item(), y1.item(), x2.item() - 1, y2.item() - 1],
+                        outline=(255, 255, 0),
+                        width=3,
+                    )
 
-                draw = ImageDraw.Draw(orig_pil)
-                draw.rectangle(
-                    [x1.item(), y1.item(), x2.item() - 1, y2.item() - 1],
-                    outline=(255, 255, 0),
-                    width=3,
-                )
-
-                axes[row, 0].imshow(np.array(orig_pil))
+                axes[row, 0].imshow(np.array(orig_pil_bbox))
                 axes[row, 0].set_ylabel(f"Channel {ch}", fontsize=14, fontweight="bold")
                 axes[row, 0].set_xticks([])
                 axes[row, 0].set_yticks([])
 
-                # Generate the overlay map for the specific channel dynamically normalized
+                orig_pil_clean = to_pil_image(orig_img_tensor)
                 hm_c = hm_orig[0, ch]
                 hm_c_norm = hm_c / (np.max(hm_c) + 1e-8)
 
-                axes_overlay[row, 0].imshow(np.array(orig_pil))
+                axes_overlay[row, 0].imshow(np.array(orig_pil_clean))
                 axes_overlay[row, 0].imshow(hm_c_norm, cmap="jet", alpha=0.6)
-                axes_overlay[row, 0].set_ylabel(
-                    f"Channel {ch}", fontsize=14, fontweight="bold"
-                )
+                axes_overlay[row, 0].set_ylabel(f"Channel {ch}", fontsize=14, fontweight="bold")
                 axes_overlay[row, 0].set_xticks([])
                 axes_overlay[row, 0].set_yticks([])
 
@@ -178,33 +169,31 @@ def explain_predictions(config: DictConfig):
                     )
 
                     proto_in_norm = (proto_in - mean) / std
-                    proto_feats = backbone(proto_in_norm)
-                    proto_rot = pixelwise_multiply(
-                        proto_feats.to(torch.float32), U().to(torch.float32)
-                    )
-
                     # Fetch the entire heatmap for the specific prototype visualization
                     hm_proto = get_heatmap(
                         backbone, mod_head, proto_in_norm, batch_size=1, device=device
                     )
 
-                    px1, py1, px2, py2 = compute_activation_bbox(
-                        proto_rot[0, ch].unsqueeze(0),
-                        (proto_img_t.shape[2], proto_img_t.shape[3]),
+                    px1, py1, px2, py2 = compute_activation_bbox_generative(
+                        torch.from_numpy(hm_proto[0, ch]).unsqueeze(0), (224, 224)
                     )
 
-                    proto_pil = to_pil_image(proto_img_t[0].float().cpu())
-                    p_draw = ImageDraw.Draw(proto_pil)
-                    p_draw.rectangle(
-                        [px1.item(), py1.item(), px2.item() - 1, py2.item() - 1],
-                        outline=(255, 255, 0),
-                        width=3,
+                    proto_pil_bbox = to_pil_image(
+                        ex_imgs_t[col].cpu().float()
                     )
-
-                    axes[row, col + 1].imshow(np.array(proto_pil))
+                    if px2 > px1 and py2 > py1:
+                        ImageDraw.Draw(proto_pil_bbox).rectangle(
+                            [px1.item(), py1.item(), px2.item() - 1, py2.item() - 1],
+                            outline=(255, 255, 0),
+                            width=3,
+                        )
+                    axes[row, col + 1].imshow(np.array(proto_pil_bbox))
                     axes[row, col + 1].axis("off")
 
-                    # Overlay for prototypes
+                    proto_pil_clean = to_pil_image(
+                        ex_imgs_t[col].cpu().float()
+                    )
+
                     hm_p_c = hm_proto[0, ch]
                     hm_p_c_tensor = torch.from_numpy(hm_p_c).unsqueeze(0).unsqueeze(0)
                     hm_p_c_resized = (
@@ -220,10 +209,8 @@ def explain_predictions(config: DictConfig):
 
                     hm_p_c_norm = hm_p_c_resized / (np.max(hm_p_c_resized) + 1e-8)
 
-                    axes_overlay[row, col + 1].imshow(np.array(proto_pil))
-                    axes_overlay[row, col + 1].imshow(
-                        hm_p_c_norm, cmap="jet", alpha=0.6
-                    )
+                    axes_overlay[row, col + 1].imshow(np.array(proto_pil_clean))
+                    axes_overlay[row, col + 1].imshow(hm_p_c_norm, cmap="jet", alpha=0.6)
                     axes_overlay[row, col + 1].axis("off")
 
             # Save the bounding box grid
