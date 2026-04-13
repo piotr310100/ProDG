@@ -61,11 +61,12 @@ def discover_initial_prompts(config, pipe, backbone, device):
 
             imgs_in = F.interpolate(gen_imgs, (224, 224), mode="bilinear")
             feats = backbone((imgs_in.float() - mean) / std).to(torch.float32)
-            feats = F.relu(feats)
+            feats_relu = F.relu(feats)
             B, C, H, W = feats.shape
 
             flat_feats = feats.view(B, C, -1)
-            max_act, max_idx = torch.max(flat_feats, dim=-1)
+            flat_feats_relu = feats_relu.view(B, C, -1)
+            max_act, max_idx = torch.max(flat_feats_relu, dim=-1)
             batch_indices = torch.arange(B, device=device).view(B, 1).expand(B, C)
             all_channel_vectors = flat_feats[batch_indices, :, max_idx]
             l2_norms = torch.linalg.norm(all_channel_vectors, dim=-1).clamp_min(1e-8)
