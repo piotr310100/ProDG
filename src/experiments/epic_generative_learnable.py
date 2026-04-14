@@ -214,7 +214,14 @@ class VariationalPromptBank(nn.Module):
                 ppe_init = torch.randn(ppe_shape, device=device) * 0.02
 
         else:
-            raise ValueError("Invalid init_mode")
+            print("Encoding empty prompts...")
+            with torch.no_grad():
+                prompt = ""
+                pe, ppe, _ = pipe.encode_prompt(
+                    prompt=[prompt], prompt_2=None, device=device
+                )
+                pe_init = pe.repeat(num_channels, 1, 1)
+                ppe_init = ppe.repeat(num_channels, 1)
 
         self.register_buffer("pe_anchor", pe_init.clone())
         self.register_buffer("ppe_anchor", ppe_init.clone())
