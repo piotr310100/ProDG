@@ -471,10 +471,14 @@ def run_epic_generative(config: DictConfig):
                 imgs_div = imgs_div.view(B, K, *imgs_div.shape[1:])
 
                 loss_div = 0.0
-                for b in range(B):
-                    loss_div += cosine_diversity(imgs_div[b])
-
-                loss_div = (config.training.lambda_diversity * loss_div) / B
+                imgs_flat = imgs_div.view(B, K, -1) 
+                imgs_norm = F.normalize(imgs_flat, dim=2)
+                sim = torch.matmul(imgs_norm, imgs_norm.transpose(1, 2))
+                mask = ~torch.eye(K, dtype=torch.bool, device=imgs_div.device)
+                sim = sim.masked_select(mask).view(B, K * (K - 1))
+                
+                loss_div = sim.mean()
+                loss_div = config.training.lambda_diversity * loss_div
             else:
                 loss_div = 0
 
