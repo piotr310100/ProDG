@@ -37,7 +37,7 @@ class ClassificationPresetEval:
             raise ValueError(f"backend can be 'tensor' or 'pil', but got {backend}")
 
         transforms += [
-            T.Resize(resize_size, interpolation=interpolation, antialias=True),
+            T.Resize((resize_size, resize_size), interpolation=interpolation, antialias=True),
             T.CenterCrop(crop_size),
         ]
 
