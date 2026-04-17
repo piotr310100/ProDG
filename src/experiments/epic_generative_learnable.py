@@ -226,7 +226,7 @@ class VariationalPromptBank(nn.Module):
         self.register_buffer("pe_anchor", pe_init.clone())
         self.register_buffer("ppe_anchor", ppe_init.clone())
 
-        self.pe_lora_A = nn.Parameter(torch.zeros(num_channels, 512, rank, device=device))
+        self.pe_lora_A = nn.Parameter(torch.randn(num_channels, 512, rank, device=device) * 0.01)
         self.pe_lora_B = nn.Parameter(torch.zeros(num_channels, rank, 4096, device=device))
 
         self.ppe_delta = nn.Parameter(torch.zeros_like(ppe_init) * 0.1)
@@ -478,12 +478,12 @@ def run_epic_generative(config: DictConfig):
                 imgs_div = imgs_div.view(B, K, *imgs_div.shape[1:])
 
                 loss_div = 0.0
-                imgs_flat = imgs_div.view(B, K, -1) 
+                imgs_flat = imgs_div.view(B, K, -1)
                 imgs_norm = F.normalize(imgs_flat, dim=2)
                 sim = torch.matmul(imgs_norm, imgs_norm.transpose(1, 2))
                 mask = ~torch.eye(K, dtype=torch.bool, device=imgs_div.device)
                 sim = sim.masked_select(mask).view(B, K * (K - 1))
-                
+
                 loss_div = sim.mean()
                 loss_div = config.training.lambda_diversity * loss_div
             else:
