@@ -230,8 +230,8 @@ class VariationalPromptBank(nn.Module):
         self.pe_lora_B = nn.Parameter(torch.zeros(num_channels, rank, 4096, device=device))
 
         self.ppe_delta = nn.Parameter(torch.zeros_like(ppe_init) * 0.1)
-        self.pe_logvar = nn.Parameter(torch.full((num_channels, 512, 1), -12.0, device=device))
-        self.ppe_logvar = nn.Parameter(torch.full_like(ppe_init, -12.0))
+        self.pe_logvar = nn.Parameter(torch.full((num_channels, 512, 1), -8.0, device=device))
+        self.ppe_logvar = nn.Parameter(torch.full_like(ppe_init, -8.0))
 
     def forward(self, channel_indices):
         A = self.pe_lora_A[channel_indices]
@@ -416,9 +416,13 @@ def run_epic_generative(config: DictConfig):
     set_seeds(config.seed)
 
     for step in pbar:
-        target_channels = torch.randint(
-            0, model_bundle.num_channels, (config.training.batch_size,), device=device
+        K = config.training.num_additional_gen_imgs
+        unique_B = config.training.batch_size // K
+
+        base_channels = torch.randint(
+            0, model_bundle.num_channels, (unique_B,), device=device
         )
+        target_channels = base_channels.repeat_interleave(K)
 
         is_U_phase = (step % CYCLE_LENGTH) < config.training.U_steps
         if step < config.training.warmup_steps:
@@ -458,36 +462,15 @@ def run_epic_generative(config: DictConfig):
                 loss_reg = 0.0
 
             if config.training.lambda_diversity > 0:
-                K = config.training.num_additional_gen_imgs
-                B = target_channels.shape[0]
-                div_channels = target_channels.repeat_interleave(K)
-
-                pe_div, ppe_div, _, _ = prompt_bank(div_channels)
-
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    imgs_div = differentiable_flux_generate(
-                        pipe,
-                        pe_div,
-                        ppe_div,
-                        num_steps=config.generative_model.gen_steps,
-                        guidance_scale=config.generative_model.guidance_scale,
-                        device=device,
-                    )
-
-                imgs_div = F.interpolate(imgs_div, (64, 64), mode="bilinear")
-                imgs_div = imgs_div.view(B, K, *imgs_div.shape[1:])
-
-                loss_div = 0.0
-                imgs_flat = imgs_div.view(B, K, -1)
-                imgs_norm = F.normalize(imgs_flat, dim=2)
-                sim = torch.matmul(imgs_norm, imgs_norm.transpose(1, 2))
-                mask = ~torch.eye(K, dtype=torch.bool, device=imgs_div.device)
-                sim = sim.masked_select(mask).view(B, K * (K - 1))
-
-                loss_div = sim.mean()
-                loss_div = config.training.lambda_diversity * loss_div
+                pooled_feats = F.adaptive_avg_pool2d(feats, (1, 1)).view(unique_B * K, -1)
+                feats_div = pooled_feats.view(unique_B, K, -1)
+                feats_norm = F.normalize(feats_div, p=2, dim=2)
+                sim_intra = torch.matmul(feats_norm, feats_norm.transpose(1, 2))
+                mask_intra = ~torch.eye(K, dtype=torch.bool, device=device)
+                sim_intra = sim_intra.masked_select(mask_intra).view(unique_B, K * (K - 1))
+                loss_div = config.training.lambda_diversity * sim_intra.mean()
             else:
-                loss_div = 0
+                loss_div = 0.0
 
             total_loss = loss_purity + loss_reg + loss_div
 
