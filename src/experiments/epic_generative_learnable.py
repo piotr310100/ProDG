@@ -223,15 +223,15 @@ class VariationalPromptBank(nn.Module):
                 pe_init = pe.repeat(num_channels, 1, 1)
                 ppe_init = ppe.repeat(num_channels, 1)
 
-        self.register_buffer("pe_anchor", pe_init.clone())
-        self.register_buffer("ppe_anchor", ppe_init.clone())
+        self.register_buffer("pe_anchor", pe_init.clone().to(torch.float32))
+        self.register_buffer("ppe_anchor", ppe_init.clone().to(torch.float32))
 
-        self.pe_lora_A = nn.Parameter(torch.randn(num_channels, 512, rank, device=device) * 0.01)
-        self.pe_lora_B = nn.Parameter(torch.zeros(num_channels, rank, 4096, device=device))
+        self.pe_lora_A = nn.Parameter(torch.randn(num_channels, 512, rank, dtype=torch.float32, device=device) * 0.01)
+        self.pe_lora_B = nn.Parameter(torch.zeros(num_channels, rank, 4096, dtype=torch.float32, device=device))
 
-        self.ppe_delta = nn.Parameter(torch.zeros_like(ppe_init) * 0.1)
-        self.pe_logvar = nn.Parameter(torch.full((num_channels, 512, 1), -8.0, device=device))
-        self.ppe_logvar = nn.Parameter(torch.full_like(ppe_init, -8.0))
+        self.ppe_delta = nn.Parameter(torch.zeros_like(ppe_init), dtype=torch.float32)
+        self.pe_logvar = nn.Parameter(torch.full((num_channels, 512, 1), -8.0, dtype=torch.float32, device=device))
+        self.ppe_logvar = nn.Parameter(torch.full_like(ppe_init, -8.0), dtype=torch.float32)
 
     def forward(self, channel_indices):
         A = self.pe_lora_A[channel_indices]
@@ -239,11 +239,11 @@ class VariationalPromptBank(nn.Module):
         delta = torch.bmm(A, B)
         pe_mu = self.pe_anchor[channel_indices] + delta
         pe_std = torch.exp(0.5 * self.pe_logvar[channel_indices])
-        pe = pe_mu + torch.randn_like(pe_std) * pe_std
+        pe = pe_mu + torch.randn_like(pe_mu) * pe_std
 
         ppe_mu = self.ppe_anchor[channel_indices] + self.ppe_delta[channel_indices]
         ppe_std = torch.exp(0.5 * self.ppe_logvar[channel_indices])
-        ppe = ppe_mu + torch.randn_like(ppe_std) * ppe_std
+        ppe = ppe_mu + torch.randn_like(ppe_mu) * ppe_std
         return (
             pe,
             ppe,
