@@ -229,9 +229,9 @@ class VariationalPromptBank(nn.Module):
         self.pe_lora_A = nn.Parameter(torch.randn(num_channels, 512, rank, dtype=torch.float32, device=device) * 0.01)
         self.pe_lora_B = nn.Parameter(torch.zeros(num_channels, rank, 4096, dtype=torch.float32, device=device))
 
-        self.ppe_delta = nn.Parameter(torch.zeros_like(ppe_init), dtype=torch.float32)
+        self.ppe_delta = nn.Parameter(torch.zeros_like(ppe_init, dtype=torch.float32))
         self.pe_logvar = nn.Parameter(torch.full((num_channels, 512, 1), -8.0, dtype=torch.float32, device=device))
-        self.ppe_logvar = nn.Parameter(torch.full_like(ppe_init, -8.0), dtype=torch.float32)
+        self.ppe_logvar = nn.Parameter(torch.full_like(ppe_init, -8.0, dtype=torch.float32))
 
     def forward(self, channel_indices):
         A = self.pe_lora_A[channel_indices]
