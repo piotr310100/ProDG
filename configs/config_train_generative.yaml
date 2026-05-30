@@ -4,11 +4,11 @@ defaults:
 
 hydra:
   run:
-    dir: ${output_path}/train_flux_epic
+    dir: ${output_path}/train_generative
 
 exp:
   run_func:
-    _target_: experiments.epic_generative_learnable.run_epic_generative
+    _target_: experiments.train_generative.run_epic_generative
 
 generative_model:
   model_id: "black-forest-labs/FLUX.1-schnell"

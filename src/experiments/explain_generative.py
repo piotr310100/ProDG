@@ -12,7 +12,7 @@ from torchvision.transforms.functional import to_pil_image
 from tqdm import tqdm
 
 from data import create_indexed_dataloader
-from experiments.epic_generative_learnable import (
+from experiments.train_generative import (
     VariationalPromptBank,
     differentiable_flux_generate,
     get_heatmap,

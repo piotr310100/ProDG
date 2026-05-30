@@ -132,7 +132,7 @@ def set_seeds(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def epic_purity(features, U, target_channels):
+def purity(features, U, target_channels):
     B, C, H, W = features.shape
     rotated = pixelwise_multiply(features, U)
     rotated_relu = torch.nn.functional.relu(rotated)
@@ -343,7 +343,7 @@ def cosine_diversity(images):
     mask = ~torch.eye(K, dtype=torch.bool, device=images.device)
     return sim[mask].mean()
 
-def run_epic_generative(config: DictConfig):
+def run_generative(config: DictConfig):
     set_seeds(config.seed)
     device = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -446,13 +446,13 @@ def run_epic_generative(config: DictConfig):
         feats = feats.to(torch.float32)
 
         if is_U_phase:
-            purity_scores, _, _ = epic_purity(feats.detach(), U(), target_channels)
+            purity_scores, _, _ = purity(feats.detach(), U(), target_channels)
             loss_purity = -config.training.lambda_purity * purity_scores.mean()
             opt_U.zero_grad(set_to_none=True)
             loss_purity.backward()
             opt_U.step()
         else:
-            purity_scores, _, _ = epic_purity(feats, U().detach(), target_channels)
+            purity_scores, _, _ = purity(feats, U().detach(), target_channels)
             loss_purity = -config.training.lambda_purity * purity_scores.mean()
             if config.training.lambda_reg > 0:
                 loss_reg = config.training.lambda_reg * prompt_bank.reg_loss(
@@ -485,7 +485,7 @@ def run_epic_generative(config: DictConfig):
         if step % 500 == 0 or (step + 1) == config.training.steps:
             plt.figure(figsize=(10, 6))
             plt.plot(purity_history, color="tab:blue")
-            plt.title(f"EPIC Purity Progress (Iter {step + 1})")
+            plt.title(f"Purity Progress (Iter {step + 1})")
             plt.savefig(os.path.join(config.output_path, "purity_history.png"))
             plt.close()
 
