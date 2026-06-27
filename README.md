@@ -67,6 +67,8 @@ We evaluate **ProDG** on four widely used benchmarks to assess its interpretabil
 
 All datasets are used in accordance with their respective licenses. For experimental reproducibility, we follow the official train/test splits and preprocessing pipelines as described in their original publications.
 
+We also include `.json` files in `class_id_to_name` subdirectory for each of the above dataset with corresponding class list used by our model during initialization.
+
 ## Datasets structure
 
 This project expects image datasets to follow the structure required by `torchvision.datasets.ImageFolder`:
