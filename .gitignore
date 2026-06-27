@@ -1,0 +1,8 @@
+.vscode
+/outputs*
+/data*
+__pycache__/
+
+output/
+slurm/
+.venv/

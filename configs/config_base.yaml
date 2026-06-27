@@ -1,0 +1,24 @@
+seed: 42
+
+output_path: outputs/resnet34
+
+model:
+  name: resnet34
+  custom_weights_path: weights/CUB/resnet34/model_34.pth
+  num_classes: 200
+
+dataset:
+  datapath_train: data/cub200_full/train
+  datapath_val: data/cub200_full/val
+  class_map_json: class_id_to_name/cub200_2011.json
+
+dataloader:
+  batch_size: 256
+  num_workers: 4
+  pin_memory: true
+
+matrix:
+  type: orthogonal
+
+prototypes:
+  purity_fn: argmax

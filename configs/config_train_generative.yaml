@@ -1,0 +1,37 @@
+defaults:
+  - _self_
+  - config_base
+
+hydra:
+  run:
+    dir: ${output_path}/train_generative
+
+exp:
+  run_func:
+    _target_: experiments.train_generative.run_epic_generative
+
+generative_model:
+  model_id: "black-forest-labs/FLUX.1-schnell"
+  gen_steps: 4
+  guidance_scale: null
+
+training:
+  steps: 10000
+  warmup_steps: 0
+  batch_size: 8
+  lr_purity: 0.001
+  lr_reg: 0.0001
+  lambda_purity: 1.0
+  lambda_reg: 0.1
+  lambda_diversity: 0.1
+  U_steps: 5
+  prompt_steps: 5
+  prompt_init: "empty"
+  num_additional_gen_imgs: 2
+
+explanations:
+  top_k: 4
+
+visualization:
+  num_explanations: 5
+  num_prototypes: 5
